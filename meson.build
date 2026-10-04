@@ -1,0 +1,60 @@
+project(
+	'augur',
+	'c',
+	version: '0.1.0',
+	license: 'BSD-3-Clause',
+	license_files: 'LICENSE',
+	meson_version: '>=1.1.0',
+	default_options: ['c_std=gnu11', 'warning_level=2', 'werror=false'],
+)
+
+add_project_arguments(
+	'-DAUGUR_VERSION="@0@"'.format(meson.project_version()),
+	'-Wno-unused-parameter',
+	'-Wno-missing-field-initializers',
+	language: 'c',
+)
+
+glib = dependency('glib-2.0', version: '>=2.74')
+gio = dependency('gio-2.0')
+gio_unix = dependency('gio-unix-2.0')
+json = dependency('json-glib-1.0')
+soup = dependency('libsoup-3.0')
+libm = meson.get_compiler('c').find_library('m', required: false)
+
+augurd = executable(
+	'augurd',
+	['src/augurd.c', 'src/config.c', 'src/provider.c', 'src/schema.c'],
+	dependencies: [glib, gio, gio_unix, json, soup, libm],
+	install: true,
+	install_dir: get_option('libexecdir'),
+)
+
+augur = executable(
+	'augur',
+	'src/augur.c',
+	dependencies: [glib, gio, gio_unix],
+	install: true,
+)
+
+# D-Bus starts augurd when a program first asks for it.
+configure_file(
+	input: 'data/io.github.matthewp.Augur.service.in',
+	output: 'io.github.matthewp.Augur.service',
+	configuration: {'libexecdir': get_option('prefix') / get_option('libexecdir')},
+	install_dir: get_option('datadir') / 'dbus-1' / 'services',
+)
+
+test_schema = executable('test_schema', ['tests/test_schema.c', 'src/schema.c'],
+	dependencies: [glib, json, libm], include_directories: 'src')
+test('schema', test_schema)
+
+# The whole service, on a bus of its own, against a pretend provider.
+python = find_program('python3', required: false)
+dbus_run_session = find_program('dbus-run-session', required: false)
+if python.found() and dbus_run_session.found()
+	test('service', find_program('tests/test_service.sh'),
+		args: [augurd.full_path(), augur.full_path(),
+			meson.current_source_dir() / 'tests' / 'mock_provider.py'],
+		depends: [augurd, augur], timeout: 60, is_parallel: false)
+endif

@@ -9,7 +9,25 @@ answer out of each of them.
 GemWM uses it, but nothing in it knows about GemWM: any program on the
 session bus can use it.
 
-This is the design, before any code. Nothing here is built yet.
+## Building and trying it
+
+It needs GLib 2.74 or later, json-glib and libsoup 3
+(`pacman -S glib2 json-glib libsoup3`), and meson:
+
+    meson setup build
+    ninja -C build
+    meson test -C build          # against a pretend provider: no keys, no cost
+    sudo ninja -C build install  # augurd, augur, and the D-Bus .service file
+
+Then write `~/.config/augur/config` (below) and ask it something:
+
+    augur status                 # on or off, and why
+    augur profiles               # the profiles, and what's wrong with any
+    augur models                 # what the default profile's provider lists
+    augur ask "Say hello"        # the answer, as it's written
+    augur ask -p anthropic -t smart -s "Be brief." "Why is the sky blue?"
+    augur ask --schema '{"type":"object","properties":{"mood":{"enum":["happy","sad"]}},"required":["mood"]}' "I lost my keys"
+    echo "a prompt from stdin" | augur ask -v    # -v: the model and tokens
 
 ## Why a service
 
@@ -73,7 +91,6 @@ tier.smart = claude-opus-5-5
 
 [profile local]
 provider = ollama
-url = http://localhost:11434
 model = qwen3:8b
 
 # Per program, by app ID: which profile, and what it uses.
@@ -81,6 +98,23 @@ model = qwen3:8b
 profile = cloud
 model = deepseek-v4-flash
 ```
+
+A profile's settings:
+
+| Key | Meaning |
+|-----|---------|
+| `provider` | `openai`, `anthropic`, `openrouter`, `cloudflare`, `ollama`, or `openai-compatible` |
+| `url` | the API's base (with its `/v1`), for `openai-compatible`, or to point any provider elsewhere |
+| `account`, `gateway` | Cloudflare: the account ID and gateway (`default` if not given); models are named `provider/model` there, e.g. `workers-ai/@cf/meta/llama-3.1-8b-instruct` |
+| `api-key-command` | prints the key (its first line is used) |
+| `api-key-env` | or: the variable holding it |
+| `gateway-key-command` | Cloudflare: prints the token for an authenticated gateway |
+| `model` | the model when nothing more particular is asked |
+| `tier.NAME` | a model for the tier NAME |
+| `structured-output` | `native` (the provider's own) or `prompt` (the schema in the prompt); the default suits the provider |
+| `max-concurrent` | requests to it at once (4) |
+
+A `#` after a value, with a space before it, starts a comment.
 
 Providers are a small set of adapters. Most providers and gateways speak
 OpenAI's chat completions (`openai`, `openrouter`, `cloudflare`, `ollama`,
@@ -133,14 +167,18 @@ interface io.github.matthewp.Augur1
   # The same, waiting for the whole answer: the simple case.
   method Ask(request: a{sv}) -> (text: s, info: a{sv})
 
-  method ListProfiles() -> (profiles: a(ssas))   # name, provider, tiers
-  method ListModels(profile: s) -> (models: as)   # where the provider says
+  method Status() -> (status: a{sv})       # enabled, config, default-profile,
+                                           # problem (why it's off), running
+  method ListProfiles() -> (profiles: a(sssas))
+                                    # name, provider, problem ("" if usable), tiers
+  method ListModels(profile: s) -> (models: as)
+                                    # what the provider lists ("": the default profile)
 
 interface io.github.matthewp.Augur1.Request     (on each handle)
 
   signal Delta(text: s)                     # streamed text, as it comes
   signal Done(text: s, info: a{sv})         # the whole answer
-  signal Failed(error: s, message: s)
+  signal Failed(error: s, message: s)       # error: a D-Bus error name
   method Cancel()
 ```
 
@@ -158,11 +196,16 @@ A request (`a{sv}`):
 | `max-tokens` | u       | optional |
 | `temperature` | d      | optional |
 
-`info` in `Done` and `Ask`: `profile`, `model`, `input-tokens`,
-`output-tokens`, and `cached` if the provider said so.
+`info` in `Done` and `Ask`: `profile` (s), `model` (s), `attempts` (i: 2
+if a structured answer was asked for again), and `input-tokens` and
+`output-tokens` (x) when the provider said.
 
 Signals for a request go to the program that made it alone (D-Bus unicast
-signals), never to the bus at large. A handle is removed once its `Done` or
+signals), never to the bus at large. Subscribe to them (sender
+`io.github.matthewp.Augur`, interface `io.github.matthewp.Augur1.Request`)
+before calling `Complete`, and keep the ones for the handle it returns: a
+short answer can be done before the reply's been read. `augur ask` does
+this; see `src/augur.c`. A handle is removed once its `Done` or
 `Failed` has gone, or when the program that made it leaves the bus (which
 cancels it).
 
@@ -171,25 +214,28 @@ program that wants to show progress) but only `Done`'s text is checked
 against the schema: if the answer doesn't match, Augur asks again once,
 saying what was wrong, then fails with `Error.Schema`.
 
-Errors: `Disabled`, `NoProfile`, `NoModel`, `Auth` (the key was refused or
-couldn't be got), `RateLimited`, `Provider` (anything else the provider
-said, with its message), `Schema`, `Cancelled`.
+Errors, each `io.github.matthewp.Augur1.Error.` and: `Disabled`,
+`NoProfile`, `NoModel`, `Auth` (the key was refused or couldn't be got),
+`RateLimited`, `Provider` (anything else the provider said, with its
+message), `Schema`, `Cancelled`. A malformed request is
+`org.freedesktop.DBus.Error.InvalidArgs`.
 
 ## Inside augurd
 
-- C, GLib/GIO for D-Bus and the main loop, libsoup 3 for HTTP (as GemWeb
-  and Crossword use), json-glib for JSON. Server-sent events (the streaming
+- C, GLib/GIO for D-Bus and the main loop, libsoup 3 for HTTP, json-glib
+  for JSON. Server-sent events (the streaming
   format both OpenAI's and Anthropic's APIs use) parsed as they arrive.
 - A queue per profile, so a burst from one program (GemMail categorising a
-  new folder) doesn't hold up an answer someone is waiting to read.
-  Requests carry no priority yet; `Ask` and streamed requests go ahead of
-  ones with a schema, as a start.
+  new folder) doesn't hold up an answer someone is waiting to read:
+  requests without a schema go ahead of ones with one, and at most
+  `max-concurrent` go to a provider at once.
+- The config is read again when it changes; `Enabled` follows, signalled.
 - Keys are fetched by running the command when first needed and kept in
   memory, never written anywhere.
 - A log of what was asked of whom (app, profile, model, tokens; not the
   text) in `~/.local/state/augur/log`, for "what's this costing me".
 
-## First user: GemMail's categories
+## First user: GemMail's categories (next)
 
 Mail can be in several categories, like "Newsletter", "Bill", "Sports".
 Categories are GemMail's; Augur only answers. (Labels, should GemMail have

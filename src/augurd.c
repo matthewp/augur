@@ -1,0 +1,1054 @@
+/*
+ * augurd: Augur's service, on the session bus as io.github.matthewp.Augur.
+ * D-Bus starts it when a program first asks, and it goes when it's had
+ * nothing to do for a while. See README.md for the interface.
+ *
+ * A request finds its profile and model, waits its turn in the profile's
+ * queue (someone waiting to read an answer goes ahead of background work),
+ * gets the key, and goes to the provider (provider.c); its text comes back
+ * as Delta signals and then Done, to the program that asked alone. An
+ * answer with a schema is checked (schema.c) and asked for once more if it
+ * doesn't match.
+ */
+#include <gio/gio.h>
+#include <glib-unix.h>
+#include <glib/gstdio.h>
+#include <math.h>
+#include <string.h>
+#include "config.h"
+#include "provider.h"
+#include "schema.h"
+
+#define BUS_NAME "io.github.matthewp.Augur"
+#define OBJECT_PATH "/io/github/matthewp/Augur"
+#define REQUEST_PATH OBJECT_PATH "/request"
+#define IFACE "io.github.matthewp.Augur1"
+#define REQUEST_IFACE IFACE ".Request"
+#define ERROR_PREFIX IFACE ".Error."
+#define IDLE_TIMEOUT 60     /* seconds with nothing to do, then exit */
+
+static const char introspection[] =
+	"<node>"
+	" <interface name='" IFACE "'>"
+	"  <property name='Enabled' type='b' access='read'/>"
+	"  <method name='Complete'>"
+	"   <arg name='request' type='a{sv}' direction='in'/>"
+	"   <arg name='handle' type='o' direction='out'/>"
+	"  </method>"
+	"  <method name='Ask'>"
+	"   <arg name='request' type='a{sv}' direction='in'/>"
+	"   <arg name='text' type='s' direction='out'/>"
+	"   <arg name='info' type='a{sv}' direction='out'/>"
+	"  </method>"
+	"  <method name='Status'>"
+	"   <arg name='status' type='a{sv}' direction='out'/>"
+	"  </method>"
+	"  <method name='ListProfiles'>"
+	"   <arg name='profiles' type='a(sssas)' direction='out'/>"
+	"  </method>"
+	"  <method name='ListModels'>"
+	"   <arg name='profile' type='s' direction='in'/>"
+	"   <arg name='models' type='as' direction='out'/>"
+	"  </method>"
+	" </interface>"
+	" <interface name='" REQUEST_IFACE "'>"
+	"  <signal name='Delta'><arg name='text' type='s'/></signal>"
+	"  <signal name='Done'>"
+	"   <arg name='text' type='s'/><arg name='info' type='a{sv}'/>"
+	"  </signal>"
+	"  <signal name='Failed'>"
+	"   <arg name='error' type='s'/><arg name='message' type='s'/>"
+	"  </signal>"
+	"  <method name='Cancel'/>"
+	" </interface>"
+	"</node>";
+
+enum augur_error {
+	AUGUR_ERROR_DISABLED,
+	AUGUR_ERROR_NO_PROFILE,
+	AUGUR_ERROR_NO_MODEL,
+	AUGUR_ERROR_AUTH,
+	AUGUR_ERROR_RATE_LIMITED,
+	AUGUR_ERROR_PROVIDER,
+	AUGUR_ERROR_SCHEMA,
+	AUGUR_ERROR_CANCELLED,
+};
+
+static const GDBusErrorEntry error_entries[] = {
+	{ AUGUR_ERROR_DISABLED, ERROR_PREFIX "Disabled" },
+	{ AUGUR_ERROR_NO_PROFILE, ERROR_PREFIX "NoProfile" },
+	{ AUGUR_ERROR_NO_MODEL, ERROR_PREFIX "NoModel" },
+	{ AUGUR_ERROR_AUTH, ERROR_PREFIX "Auth" },
+	{ AUGUR_ERROR_RATE_LIMITED, ERROR_PREFIX "RateLimited" },
+	{ AUGUR_ERROR_PROVIDER, ERROR_PREFIX "Provider" },
+	{ AUGUR_ERROR_SCHEMA, ERROR_PREFIX "Schema" },
+	{ AUGUR_ERROR_CANCELLED, ERROR_PREFIX "Cancelled" },
+};
+
+static GQuark augur_error_quark(void) {
+	static gsize quark;
+	g_dbus_error_register_error_domain("augur-error-quark", &quark,
+		error_entries, G_N_ELEMENTS(error_entries));
+	return (GQuark)quark;
+}
+#define AUGUR_ERROR augur_error_quark()
+
+struct request {
+	guint id;
+	char *path;           /* NULL for Ask */
+	guint registration;
+	char *sender;
+	GDBusMethodInvocation *ask;
+	char *app_id;
+	struct config *config;
+	struct profile *profile;
+	char *model;
+	JsonArray *messages;
+	JsonNode *schema;
+	gint64 max_tokens;
+	double temperature;
+	bool stream;
+	bool interactive;     /* someone's waiting to read it */
+	bool running;         /* has its place: out of the queue */
+	bool sender_gone;     /* no one to tell */
+	int attempts;
+	gint64 input_tokens, output_tokens;
+	GCancellable *cancel;
+};
+
+/* A profile's turn-taking. */
+struct queue {
+	int running;
+	GQueue interactive, background;
+};
+
+static struct {
+	GMainLoop *loop;
+	GDBusConnection *bus;
+	GDBusNodeInfo *info;
+	struct config *config;
+	char *config_error;
+	char *config_file;
+	GFileMonitor *monitor;
+	guint reload_id;
+	bool disabled_by_env;
+	bool enabled;
+	SoupSession *soup;
+	GHashTable *requests;  /* id -> struct request */
+	GHashTable *queues;    /* profile name -> struct queue */
+	GHashTable *keys;      /* profile name -> its key; "name\x01gw" its gateway's */
+	guint next_id;
+	int busy;              /* requests and listings under way */
+	int idle_timeout;
+	guint idle_id;
+	bool owned;            /* the name was ours */
+	int status;            /* to exit with */
+} srv;
+
+static void pump(const char *profile);
+
+/* ---- Staying, and going ---------------------------------------------------- */
+
+static gboolean idle_exit(gpointer data) {
+	srv.idle_id = 0;
+	g_main_loop_quit(srv.loop);
+	return G_SOURCE_REMOVE;
+}
+
+static void busy(int change) {
+	srv.busy += change;
+	g_clear_handle_id(&srv.idle_id, g_source_remove);
+	if (srv.busy == 0 && srv.idle_timeout > 0) {
+		srv.idle_id = g_timeout_add_seconds(srv.idle_timeout, idle_exit, NULL);
+	}
+}
+
+/* ---- The configuration ------------------------------------------------------ */
+
+static bool usable(void) {
+	for (guint i = 0; i < srv.config->profiles->len; i++) {
+		if (((struct profile *)srv.config->profiles->pdata[i])->problem == NULL) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void update_enabled(void) {
+	bool enabled = srv.config->enabled && !srv.disabled_by_env && usable();
+	if (enabled == srv.enabled) {
+		return;
+	}
+	srv.enabled = enabled;
+	if (srv.bus == NULL) {
+		return;
+	}
+	GVariantBuilder changed;
+	g_variant_builder_init(&changed, G_VARIANT_TYPE("a{sv}"));
+	g_variant_builder_add(&changed, "{sv}", "Enabled",
+		g_variant_new_boolean(enabled));
+	g_dbus_connection_emit_signal(srv.bus, NULL, OBJECT_PATH,
+		"org.freedesktop.DBus.Properties", "PropertiesChanged",
+		g_variant_new("(sa{sv}as)", IFACE, &changed, NULL), NULL);
+}
+
+static void load_config(void) {
+	char *error = NULL;
+	struct config *c = config_load(srv.config_file, &error);
+	config_unref(srv.config);
+	srv.config = c;
+	g_free(srv.config_error);
+	srv.config_error = error;
+	if (error != NULL) {
+		g_warning("%s", error);
+	}
+	/* A key command may have changed with it. */
+	g_hash_table_remove_all(srv.keys);
+	update_enabled();
+}
+
+static gboolean reload(gpointer data) {
+	srv.reload_id = 0;
+	load_config();
+	return G_SOURCE_REMOVE;
+}
+
+static void config_changed(GFileMonitor *m, GFile *file, GFile *other,
+		GFileMonitorEvent event, gpointer data) {
+	/* Editors write in steps: read it once they've finished. */
+	g_clear_handle_id(&srv.reload_id, g_source_remove);
+	srv.reload_id = g_timeout_add(200, reload, NULL);
+}
+
+/* ---- The log -------------------------------------------------------------- */
+
+/* What was asked of whom, never the text: for what it's costing. */
+static void log_request(struct request *r, const char *result) {
+	char *dir = g_build_filename(g_get_user_state_dir(), "augur", NULL);
+	char *path = g_build_filename(dir, "log", NULL);
+	g_mkdir_with_parents(dir, 0700);
+	JsonBuilder *b = json_builder_new();
+	json_builder_begin_object(b);
+	GDateTime *now = g_date_time_new_now_local();
+	char *time = g_date_time_format_iso8601(now);
+	g_date_time_unref(now);
+	json_builder_set_member_name(b, "time");
+	json_builder_add_string_value(b, time);
+	json_builder_set_member_name(b, "app");
+	json_builder_add_string_value(b, r->app_id);
+	json_builder_set_member_name(b, "profile");
+	json_builder_add_string_value(b, r->profile != NULL ? r->profile->name : "");
+	json_builder_set_member_name(b, "model");
+	json_builder_add_string_value(b, r->model != NULL ? r->model : "");
+	json_builder_set_member_name(b, "input-tokens");
+	json_builder_add_int_value(b, r->input_tokens);
+	json_builder_set_member_name(b, "output-tokens");
+	json_builder_add_int_value(b, r->output_tokens);
+	json_builder_set_member_name(b, "attempts");
+	json_builder_add_int_value(b, r->attempts);
+	json_builder_set_member_name(b, "result");
+	json_builder_add_string_value(b, result);
+	json_builder_end_object(b);
+	JsonNode *root = json_builder_get_root(b);
+	char *line = json_to_string(root, FALSE);
+	FILE *f = fopen(path, "a");
+	if (f != NULL) {
+		fprintf(f, "%s\n", line);
+		fclose(f);
+	}
+	g_free(line);
+	json_node_unref(root);
+	g_object_unref(b);
+	g_free(time);
+	g_free(path);
+	g_free(dir);
+}
+
+/* ---- Requests: the end ----------------------------------------------------- */
+
+static struct queue *queue_of(const char *profile) {
+	struct queue *q = g_hash_table_lookup(srv.queues, profile);
+	if (q == NULL) {
+		q = g_new0(struct queue, 1);
+		g_queue_init(&q->interactive);
+		g_queue_init(&q->background);
+		g_hash_table_insert(srv.queues, g_strdup(profile), q);
+	}
+	return q;
+}
+
+static void request_free(struct request *r) {
+	if (r->registration != 0) {
+		g_dbus_connection_unregister_object(srv.bus, r->registration);
+	}
+	g_free(r->path);
+	g_free(r->sender);
+	g_free(r->app_id);
+	g_free(r->model);
+	if (r->messages != NULL) {
+		json_array_unref(r->messages);
+	}
+	if (r->schema != NULL) {
+		json_node_unref(r->schema);
+	}
+	g_clear_object(&r->cancel);
+	config_unref(r->config);
+	g_free(r);
+}
+
+/* It's over: out of the table, its place given up. */
+static void request_end(struct request *r, const char *result) {
+	log_request(r, result);
+	char *profile = r->profile != NULL ? g_strdup(r->profile->name) : NULL;
+	if (r->running && profile != NULL) {
+		queue_of(profile)->running--;
+	}
+	g_hash_table_remove(srv.requests, GUINT_TO_POINTER(r->id));
+	request_free(r);
+	if (profile != NULL) {
+		pump(profile);
+		g_free(profile);
+	}
+	busy(-1);
+}
+
+static GVariant *info_of(struct request *r) {
+	GVariantBuilder b;
+	g_variant_builder_init(&b, G_VARIANT_TYPE("a{sv}"));
+	g_variant_builder_add(&b, "{sv}", "profile",
+		g_variant_new_string(r->profile->name));
+	g_variant_builder_add(&b, "{sv}", "model", g_variant_new_string(r->model));
+	if (r->input_tokens >= 0) {
+		g_variant_builder_add(&b, "{sv}", "input-tokens",
+			g_variant_new_int64(r->input_tokens));
+	}
+	if (r->output_tokens >= 0) {
+		g_variant_builder_add(&b, "{sv}", "output-tokens",
+			g_variant_new_int64(r->output_tokens));
+	}
+	g_variant_builder_add(&b, "{sv}", "attempts",
+		g_variant_new_int32(r->attempts));
+	return g_variant_builder_end(&b);
+}
+
+static void emit(struct request *r, const char *signal, GVariant *args) {
+	if (r->sender_gone) {
+		g_variant_unref(g_variant_ref_sink(args));
+		return;
+	}
+	g_dbus_connection_emit_signal(srv.bus, r->sender, r->path, REQUEST_IFACE,
+		signal, args, NULL);
+}
+
+static void succeed(struct request *r, const char *text) {
+	if (r->ask != NULL) {
+		g_dbus_method_invocation_return_value(r->ask,
+			g_variant_new("(s@a{sv})", text, info_of(r)));
+		r->ask = NULL;
+	} else {
+		emit(r, "Done", g_variant_new("(s@a{sv})", text, info_of(r)));
+	}
+	request_end(r, "ok");
+}
+
+static void fail(struct request *r, enum augur_error code, const char *message) {
+	const char *name = error_entries[code].dbus_error_name;
+	if (r->ask != NULL) {
+		g_dbus_method_invocation_return_error_literal(r->ask, AUGUR_ERROR, code,
+			message);
+		r->ask = NULL;
+	} else {
+		emit(r, "Failed", g_variant_new("(ss)", name, message));
+	}
+	request_end(r, name + strlen(ERROR_PREFIX));
+}
+
+/* ---- Requests: asking ------------------------------------------------------- */
+
+static void ask_provider(struct request *r);
+
+static void delta(const char *text, void *data) {
+	struct request *r = data;
+	if (r->stream && r->path != NULL) {
+		emit(r, "Delta", g_variant_new("(s)", text));
+	}
+}
+
+static enum augur_error error_for(enum call_error e) {
+	switch (e) {
+	case CALL_AUTH: return AUGUR_ERROR_AUTH;
+	case CALL_RATE_LIMITED: return AUGUR_ERROR_RATE_LIMITED;
+	case CALL_CANCELLED: return AUGUR_ERROR_CANCELLED;
+	default: return AUGUR_ERROR_PROVIDER;
+	}
+}
+
+static void add_message(struct request *r, const char *role,
+		const char *content) {
+	JsonObject *m = json_object_new();
+	json_object_set_string_member(m, "role", role);
+	json_object_set_string_member(m, "content", content);
+	json_array_add_object_element(r->messages, m);
+}
+
+static void answered(struct call_result *result, void *data) {
+	struct request *r = data;
+	if (result->input_tokens >= 0) {
+		r->input_tokens = MAX(r->input_tokens, 0) + result->input_tokens;
+	}
+	if (result->output_tokens >= 0) {
+		r->output_tokens = MAX(r->output_tokens, 0) + result->output_tokens;
+	}
+	if (result->error != CALL_OK) {
+		if (result->error == CALL_AUTH) {
+			g_hash_table_remove(srv.keys, r->profile->name); /* get it again */
+		}
+		fail(r, error_for(result->error), result->message);
+		return;
+	}
+	if (r->schema == NULL) {
+		succeed(r, result->text);
+		return;
+	}
+	char *why = NULL;
+	JsonNode *answer = schema_parse_answer(result->text, &why);
+	if (answer != NULL && schema_check(r->schema, answer, &why)) {
+		/* As JSON, without any code fence round it. */
+		char *json = json_to_string(answer, FALSE);
+		succeed(r, json);
+		g_free(json);
+	} else if (r->attempts < 2) {
+		/* Once more, saying what was wrong. */
+		add_message(r, "assistant", result->text);
+		char *again = g_strdup_printf("That doesn't match the JSON Schema: %s. "
+			"Reply again with only JSON that matches it.", why);
+		add_message(r, "user", again);
+		g_free(again);
+		ask_provider(r);
+	} else {
+		fail(r, AUGUR_ERROR_SCHEMA, why);
+	}
+	if (answer != NULL) {
+		json_node_unref(answer);
+	}
+	g_free(why);
+}
+
+static void ask_provider(struct request *r) {
+	r->attempts++;
+	struct call_spec spec = {
+		.profile = r->profile,
+		.model = r->model,
+		.key = g_hash_table_lookup(srv.keys, r->profile->name),
+		.messages = r->messages,
+		.schema = r->schema,
+		.max_tokens = r->max_tokens,
+		.temperature = r->temperature,
+	};
+	char *gw = g_strdup_printf("%s\x01gw", r->profile->name);
+	spec.gateway_key = g_hash_table_lookup(srv.keys, gw);
+	g_free(gw);
+	call_start(srv.soup, &spec, r->cancel, delta, answered, r);
+}
+
+/* ---- Requests: the key ------------------------------------------------------ */
+
+struct key_job {
+	struct request *r;
+	char *slot;            /* where in srv.keys it goes */
+	bool gateway;
+};
+
+static void key_ready(GObject *src, GAsyncResult *res, gpointer data);
+
+/* Runs a key command; then key_ready. */
+static void run_key_command(struct request *r, const char *command,
+		const char *slot, bool gateway) {
+	GError *err = NULL;
+	const char *argv[] = { "/bin/sh", "-c", command, NULL };
+	GSubprocess *p = g_subprocess_newv(argv, G_SUBPROCESS_FLAGS_STDOUT_PIPE |
+		G_SUBPROCESS_FLAGS_STDERR_PIPE, &err);
+	if (p == NULL) {
+		char *m = g_strdup_printf("couldn't run the key command: %s", err->message);
+		g_error_free(err);
+		fail(r, AUGUR_ERROR_AUTH, m);
+		g_free(m);
+		return;
+	}
+	struct key_job *job = g_new0(struct key_job, 1);
+	job->r = r;
+	job->slot = g_strdup(slot);
+	job->gateway = gateway;
+	g_subprocess_communicate_utf8_async(p, NULL, r->cancel, key_ready, job);
+	g_object_unref(p);
+}
+
+/* The keys this request needs, then the provider. */
+static void with_keys(struct request *r) {
+	struct profile *p = r->profile;
+	char *gw = g_strdup_printf("%s\x01gw", p->name);
+	if (!g_hash_table_contains(srv.keys, p->name)) {
+		const char *env = p->key_env != NULL ? g_getenv(p->key_env) : NULL;
+		if (p->key_command != NULL) {
+			run_key_command(r, p->key_command, p->name, false);
+			g_free(gw);
+			return;
+		}
+		if (p->key_env != NULL && env == NULL && p->needs_key) {
+			char *m = g_strdup_printf("%s isn't set", p->key_env);
+			fail(r, AUGUR_ERROR_AUTH, m);
+			g_free(m);
+			g_free(gw);
+			return;
+		}
+		if (env != NULL) {
+			g_hash_table_insert(srv.keys, g_strdup(p->name), g_strdup(env));
+		}
+	}
+	if (p->gateway_key_command != NULL && !g_hash_table_contains(srv.keys, gw)) {
+		run_key_command(r, p->gateway_key_command, gw, true);
+		g_free(gw);
+		return;
+	}
+	g_free(gw);
+	ask_provider(r);
+}
+
+static void key_ready(GObject *src, GAsyncResult *res, gpointer data) {
+	struct key_job *job = data;
+	struct request *r = job->r;
+	char *out = NULL, *errout = NULL;
+	GError *err = NULL;
+	bool ok = g_subprocess_communicate_utf8_finish(G_SUBPROCESS(src), res, &out,
+		&errout, &err);
+	if (!ok && g_error_matches(err, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
+		fail(r, AUGUR_ERROR_CANCELLED, "cancelled");
+	} else if (!ok || !g_subprocess_get_successful(G_SUBPROCESS(src)) ||
+			out == NULL || g_strstrip(out)[0] == '\0') {
+		char *m = g_strdup_printf("the %s command gave no key%s%s",
+			job->gateway ? "gateway key" : "API key",
+			errout != NULL && g_strstrip(errout)[0] ? ": " : "",
+			errout != NULL ? errout : "");
+		fail(r, AUGUR_ERROR_AUTH, m);
+		g_free(m);
+	} else {
+		/* Only the first line: some commands print more. */
+		char *nl = strchr(out, '\n');
+		if (nl != NULL) {
+			*nl = '\0';
+		}
+		g_hash_table_insert(srv.keys, g_strdup(job->slot), g_strdup(out));
+		with_keys(r);
+	}
+	g_clear_error(&err);
+	g_free(out);
+	g_free(errout);
+	g_free(job->slot);
+	g_free(job);
+}
+
+/* ---- Requests: turns --------------------------------------------------------- */
+
+static void pump(const char *profile) {
+	struct queue *q = queue_of(profile);
+	for (;;) {
+		struct request *r = g_queue_pop_head(&q->interactive);
+		if (r == NULL) {
+			r = g_queue_pop_head(&q->background);
+		}
+		if (r == NULL) {
+			return;
+		}
+		if (q->running >= r->profile->max_concurrent) {
+			g_queue_push_head(r->interactive ? &q->interactive : &q->background, r);
+			return;
+		}
+		q->running++;
+		r->running = true;
+		with_keys(r);
+	}
+}
+
+static gboolean start_soon(gpointer data) {
+	char *profile = data;
+	pump(profile);
+	g_free(profile);
+	return G_SOURCE_REMOVE;
+}
+
+/* ---- Requests: the beginning ---------------------------------------------------- */
+
+static bool parse_messages(GVariant *v, JsonArray *out, GError **error) {
+	GVariantIter it;
+	GVariant *m;
+	g_variant_iter_init(&it, v);
+	while ((m = g_variant_iter_next_value(&it)) != NULL) {
+		const char *role = NULL, *content = NULL;
+		g_variant_lookup(m, "role", "&s", &role);
+		g_variant_lookup(m, "content", "&s", &content);
+		bool ok = role != NULL && content != NULL &&
+			(strcmp(role, "system") == 0 || strcmp(role, "user") == 0 ||
+				strcmp(role, "assistant") == 0);
+		if (ok) {
+			JsonObject *o = json_object_new();
+			json_object_set_string_member(o, "role", role);
+			json_object_set_string_member(o, "content", content);
+			json_array_add_object_element(out, o);
+		}
+		g_variant_unref(m);
+		if (!ok) {
+			g_set_error_literal(error, G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS,
+				"each message needs a role (system, user or assistant) and content");
+			return false;
+		}
+	}
+	if (json_array_get_length(out) == 0) {
+		g_set_error_literal(error, G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS,
+			"there are no messages");
+		return false;
+	}
+	return true;
+}
+
+/* Which profile and model, as README.md's "Which model" says. */
+static bool resolve(struct request *r, const char *profile_name,
+		const char *model, const char *tier, GError **error) {
+	const struct app_settings *app = config_app(r->config, r->app_id);
+	struct profile *p = profile_name != NULL ?
+		config_profile(r->config, profile_name) :
+		app != NULL && app->profile != NULL ? config_profile(r->config, app->profile) :
+		config_default_profile(r->config);
+	const char *asked = profile_name != NULL ? profile_name :
+		app != NULL && app->profile != NULL ? app->profile : r->config->default_profile;
+	if (p == NULL) {
+		g_set_error(error, AUGUR_ERROR, AUGUR_ERROR_NO_PROFILE,
+			asked != NULL ? "there's no profile \"%s\"" : "there's no profile%s",
+			asked != NULL ? asked : "");
+		return false;
+	}
+	if (p->problem != NULL) {
+		g_set_error(error, AUGUR_ERROR, AUGUR_ERROR_NO_PROFILE,
+			"profile \"%s\" can't be used: %s", p->name, p->problem);
+		return false;
+	}
+	r->profile = p;
+	const char *chosen = NULL;
+	if (model != NULL) {
+		chosen = model;
+	} else if (tier != NULL) {
+		chosen = g_hash_table_lookup(p->tiers, tier);
+		if (chosen == NULL) {
+			g_set_error(error, AUGUR_ERROR, AUGUR_ERROR_NO_MODEL,
+				"profile \"%s\" has no tier \"%s\"", p->name, tier);
+			return false;
+		}
+	} else if (app != NULL && app->model != NULL) {
+		chosen = app->model;
+	} else if (app != NULL && app->tier != NULL &&
+			g_hash_table_lookup(p->tiers, app->tier) != NULL) {
+		chosen = g_hash_table_lookup(p->tiers, app->tier);
+	} else {
+		chosen = p->model;
+	}
+	if (chosen == NULL) {
+		g_set_error(error, AUGUR_ERROR, AUGUR_ERROR_NO_MODEL,
+			"profile \"%s\" has no model; ask for one of its tiers", p->name);
+		return false;
+	}
+	r->model = g_strdup(chosen);
+	return true;
+}
+
+static struct request *request_new(GVariant *params, const char *sender,
+		bool is_ask, GError **error) {
+	if (!srv.enabled) {
+		g_set_error_literal(error, AUGUR_ERROR, AUGUR_ERROR_DISABLED,
+			"Augur is turned off");
+		return NULL;
+	}
+	GVariant *req = g_variant_get_child_value(params, 0);
+	struct request *r = g_new0(struct request, 1);
+	r->config = config_ref(srv.config);
+	r->sender = g_strdup(sender);
+	r->input_tokens = r->output_tokens = -1;
+	r->temperature = -1;
+	r->messages = json_array_new();
+	r->cancel = g_cancellable_new();
+	const char *app_id = NULL, *profile = NULL, *model = NULL, *tier = NULL;
+	const char *schema = NULL;
+	gboolean stream = !is_ask;
+	guint32 max_tokens = 0;
+	double temperature = -1;
+	g_variant_lookup(req, "app-id", "&s", &app_id);
+	g_variant_lookup(req, "profile", "&s", &profile);
+	g_variant_lookup(req, "model", "&s", &model);
+	g_variant_lookup(req, "tier", "&s", &tier);
+	g_variant_lookup(req, "schema", "&s", &schema);
+	g_variant_lookup(req, "stream", "b", &stream);
+	g_variant_lookup(req, "max-tokens", "u", &max_tokens);
+	g_variant_lookup(req, "temperature", "d", &temperature);
+	GVariant *messages = g_variant_lookup_value(req, "messages",
+		G_VARIANT_TYPE("aa{sv}"));
+	r->app_id = g_strdup(app_id != NULL ? app_id : "");
+	r->stream = stream && !is_ask;
+	r->max_tokens = max_tokens;
+	r->temperature = temperature;
+	bool ok = true;
+	if (app_id == NULL || app_id[0] == '\0') {
+		g_set_error_literal(error, G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS,
+			"app-id is needed: who's asking");
+		ok = false;
+	} else if (messages == NULL) {
+		g_set_error_literal(error, G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS,
+			"messages is needed (aa{sv}: role and content)");
+		ok = false;
+	} else {
+		ok = parse_messages(messages, r->messages, error);
+	}
+	if (ok && schema != NULL) {
+		char *why = NULL;
+		r->schema = schema_parse_answer(schema, &why);
+		if (r->schema == NULL || !(JSON_NODE_HOLDS_OBJECT(r->schema) ||
+				JSON_NODE_HOLDS_VALUE(r->schema))) {
+			g_set_error(error, G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS,
+				"the schema isn't a JSON Schema%s%s", why != NULL ? ": " : "",
+				why != NULL ? why : "");
+			ok = false;
+		}
+		g_free(why);
+	}
+	ok = ok && resolve(r, profile, model, tier, error);
+	r->interactive = r->schema == NULL;
+	if (messages != NULL) {
+		g_variant_unref(messages);
+	}
+	g_variant_unref(req);
+	if (!ok) {
+		request_free(r);
+		return NULL;
+	}
+	r->id = ++srv.next_id;
+	g_hash_table_insert(srv.requests, GUINT_TO_POINTER(r->id), r);
+	busy(+1);
+	return r;
+}
+
+/* After the reply's gone: the request waits its turn. */
+static void enqueue(struct request *r) {
+	struct queue *q = queue_of(r->profile->name);
+	g_queue_push_tail(r->interactive ? &q->interactive : &q->background, r);
+	g_idle_add(start_soon, g_strdup(r->profile->name));
+}
+
+static void cancel(struct request *r) {
+	if (r->running) {
+		g_cancellable_cancel(r->cancel);
+		return;
+	}
+	/* Still waiting: out of the queue, and done. */
+	struct queue *q = queue_of(r->profile->name);
+	g_queue_remove(&q->interactive, r);
+	g_queue_remove(&q->background, r);
+	fail(r, AUGUR_ERROR_CANCELLED, "cancelled");
+}
+
+/* ---- D-Bus: a request's object ------------------------------------------------ */
+
+static void request_method(GDBusConnection *bus, const char *sender,
+		const char *path, const char *iface, const char *method,
+		GVariant *params, GDBusMethodInvocation *inv, gpointer data) {
+	struct request *r = g_hash_table_lookup(srv.requests, data);
+	if (r == NULL || g_strcmp0(sender, r->sender) != 0) {
+		g_dbus_method_invocation_return_error_literal(inv, G_DBUS_ERROR,
+			G_DBUS_ERROR_ACCESS_DENIED, "not yours");
+		return;
+	}
+	g_dbus_method_invocation_return_value(inv, NULL);
+	cancel(r);
+}
+
+static const GDBusInterfaceVTable request_vtable = { request_method, NULL, NULL,
+	{ 0 } };
+
+/* ---- D-Bus: the service -------------------------------------------------------- */
+
+static void return_gerror(GDBusMethodInvocation *inv, GError *error) {
+	g_dbus_method_invocation_return_gerror(inv, error);
+	g_error_free(error);
+}
+
+struct models_call {
+	GDBusMethodInvocation *inv;
+	struct config *config;
+	char *profile;
+};
+
+static void models_listed(GPtrArray *models, const char *error, void *data) {
+	struct models_call *m = data;
+	if (models == NULL) {
+		g_dbus_method_invocation_return_error_literal(m->inv, AUGUR_ERROR,
+			AUGUR_ERROR_PROVIDER, error);
+	} else {
+		GVariantBuilder b;
+		g_variant_builder_init(&b, G_VARIANT_TYPE("as"));
+		for (guint i = 0; i < models->len; i++) {
+			g_variant_builder_add(&b, "s", models->pdata[i]);
+		}
+		g_dbus_method_invocation_return_value(m->inv, g_variant_new("(as)", &b));
+	}
+	config_unref(m->config);
+	g_free(m->profile);
+	g_free(m);
+	busy(-1);
+}
+
+/* Listing needs only a key from the environment or an earlier request;
+ * failing that, the profile's tiers and model are listed. */
+static void list_models(GVariant *params, GDBusMethodInvocation *inv) {
+	const char *name;
+	g_variant_get(params, "(&s)", &name);
+	struct profile *p = name[0] != '\0' ? config_profile(srv.config, name) :
+		config_default_profile(srv.config);
+	if (p == NULL || p->problem != NULL) {
+		g_dbus_method_invocation_return_error(inv, AUGUR_ERROR,
+			AUGUR_ERROR_NO_PROFILE, "no usable profile \"%s\"", name);
+		return;
+	}
+	const char *key = g_hash_table_lookup(srv.keys, p->name);
+	if (key == NULL && p->key_env != NULL) {
+		key = g_getenv(p->key_env);
+	}
+	if (key == NULL && p->key_command != NULL) {
+		char *out = NULL;
+		if (g_spawn_command_line_sync(p->key_command, &out, NULL, NULL, NULL) &&
+				out != NULL && g_strstrip(out)[0] != '\0') {
+			char *nl = strchr(out, '\n');
+			if (nl != NULL) {
+				*nl = '\0';
+			}
+			g_hash_table_insert(srv.keys, g_strdup(p->name), g_strdup(out));
+			key = g_hash_table_lookup(srv.keys, p->name);
+		}
+		g_free(out);
+	}
+	struct models_call *m = g_new0(struct models_call, 1);
+	m->inv = inv;
+	m->config = config_ref(srv.config);
+	m->profile = g_strdup(p->name);
+	busy(+1);
+	call_list_models(srv.soup, p, key, models_listed, m);
+}
+
+static GVariant *status(void) {
+	GVariantBuilder b;
+	g_variant_builder_init(&b, G_VARIANT_TYPE("a{sv}"));
+	g_variant_builder_add(&b, "{sv}", "enabled",
+		g_variant_new_boolean(srv.enabled));
+	g_variant_builder_add(&b, "{sv}", "config",
+		g_variant_new_string(srv.config_file));
+	struct profile *def = config_default_profile(srv.config);
+	if (def != NULL) {
+		g_variant_builder_add(&b, "{sv}", "default-profile",
+			g_variant_new_string(def->name));
+	}
+	const char *why = NULL;
+	if (srv.config_error != NULL) {
+		why = srv.config_error;
+	} else if (srv.disabled_by_env) {
+		why = "AUGUR_DISABLED is set (by the session, e.g. GemWM's [ai])";
+	} else if (!srv.config->enabled) {
+		why = "turned off in the config ([augur] enabled = false)";
+	} else if (srv.config->profiles->len == 0) {
+		why = "no profiles in the config";
+	} else if (!usable()) {
+		why = "no profile can be used";
+	}
+	if (why != NULL) {
+		g_variant_builder_add(&b, "{sv}", "problem", g_variant_new_string(why));
+	}
+	g_variant_builder_add(&b, "{sv}", "running",
+		g_variant_new_uint32(g_hash_table_size(srv.requests)));
+	return g_variant_builder_end(&b);
+}
+
+static GVariant *profiles(void) {
+	GVariantBuilder b;
+	g_variant_builder_init(&b, G_VARIANT_TYPE("a(sssas)"));
+	for (guint i = 0; i < srv.config->profiles->len; i++) {
+		struct profile *p = srv.config->profiles->pdata[i];
+		GVariantBuilder tiers;
+		g_variant_builder_init(&tiers, G_VARIANT_TYPE("as"));
+		GList *names = g_hash_table_get_keys(p->tiers);
+		names = g_list_sort(names, (GCompareFunc)strcmp);
+		for (GList *l = names; l != NULL; l = l->next) {
+			g_variant_builder_add(&tiers, "s", l->data);
+		}
+		g_list_free(names);
+		g_variant_builder_add(&b, "(sssas)", p->name,
+			p->provider != NULL ? p->provider : "",
+			p->problem != NULL ? p->problem : "", &tiers);
+	}
+	return g_variant_builder_end(&b);
+}
+
+static void method(GDBusConnection *bus, const char *sender, const char *path,
+		const char *iface, const char *name, GVariant *params,
+		GDBusMethodInvocation *inv, gpointer data) {
+	GError *error = NULL;
+	if (strcmp(name, "Complete") == 0 || strcmp(name, "Ask") == 0) {
+		bool ask = strcmp(name, "Ask") == 0;
+		struct request *r = request_new(params, sender, ask, &error);
+		if (r == NULL) {
+			return_gerror(inv, error);
+			return;
+		}
+		if (ask) {
+			r->ask = inv;
+		} else {
+			r->path = g_strdup_printf(REQUEST_PATH "/%u", r->id);
+			r->registration = g_dbus_connection_register_object(srv.bus, r->path,
+				g_dbus_node_info_lookup_interface(srv.info, REQUEST_IFACE),
+				&request_vtable, GUINT_TO_POINTER(r->id), NULL, NULL);
+			g_dbus_method_invocation_return_value(inv,
+				g_variant_new("(o)", r->path));
+		}
+		enqueue(r);
+	} else if (strcmp(name, "Status") == 0) {
+		g_dbus_method_invocation_return_value(inv,
+			g_variant_new("(@a{sv})", status()));
+	} else if (strcmp(name, "ListProfiles") == 0) {
+		g_dbus_method_invocation_return_value(inv,
+			g_variant_new("(@a(sssas))", profiles()));
+	} else if (strcmp(name, "ListModels") == 0) {
+		list_models(params, inv);
+	}
+}
+
+static GVariant *get_property(GDBusConnection *bus, const char *sender,
+		const char *path, const char *iface, const char *name, GError **error,
+		gpointer data) {
+	return strcmp(name, "Enabled") == 0 ? g_variant_new_boolean(srv.enabled) :
+		NULL;
+}
+
+static const GDBusInterfaceVTable vtable = { method, get_property, NULL,
+	{ 0 } };
+
+/* A program left the bus: what it asked for is no use to anyone now. */
+static void owner_changed(GDBusConnection *bus, const char *sender,
+		const char *path, const char *iface, const char *signal,
+		GVariant *params, gpointer data) {
+	const char *name, *old, *new;
+	g_variant_get(params, "(&s&s&s)", &name, &old, &new);
+	if (name[0] != ':' || new[0] != '\0') {
+		return;
+	}
+	GList *all = g_hash_table_get_values(srv.requests);
+	for (GList *l = all; l != NULL; l = l->next) {
+		struct request *r = l->data;
+		if (strcmp(r->sender, name) == 0) {
+			r->sender_gone = true;
+			cancel(r);
+		}
+	}
+	g_list_free(all);
+}
+
+static void bus_acquired(GDBusConnection *bus, const char *name, gpointer data) {
+	srv.bus = bus;
+	GError *error = NULL;
+	if (g_dbus_connection_register_object(bus, OBJECT_PATH,
+			g_dbus_node_info_lookup_interface(srv.info, IFACE), &vtable, NULL,
+			NULL, &error) == 0) {
+		g_printerr("augurd: %s\n", error->message);
+		g_error_free(error);
+		g_main_loop_quit(srv.loop);
+		return;
+	}
+	g_dbus_connection_signal_subscribe(bus, "org.freedesktop.DBus",
+		"org.freedesktop.DBus", "NameOwnerChanged", "/org/freedesktop/DBus",
+		NULL, G_DBUS_SIGNAL_FLAGS_NONE, owner_changed, NULL, NULL);
+}
+
+static void name_acquired(GDBusConnection *bus, const char *name,
+		gpointer data) {
+	srv.owned = true;
+}
+
+/* Never had it: another augurd has. Had it: the bus has gone. */
+static void name_lost(GDBusConnection *bus, const char *name, gpointer data) {
+	if (!srv.owned) {
+		g_printerr("augurd: couldn't have %s on the session bus "
+			"(is another augurd running?)\n", name);
+		srv.status = 1;
+	}
+	g_main_loop_quit(srv.loop);
+}
+
+static gboolean on_signal(gpointer data) {
+	g_main_loop_quit(srv.loop);
+	return G_SOURCE_REMOVE;
+}
+
+int main(int argc, char *argv[]) {
+	gboolean stay = FALSE, version = FALSE;
+	int idle = IDLE_TIMEOUT;
+	char *config = NULL;
+	GOptionEntry entries[] = {
+		{ "no-exit", 0, 0, G_OPTION_ARG_NONE, &stay,
+			"Keep running with nothing to do", NULL },
+		{ "idle-timeout", 0, 0, G_OPTION_ARG_INT, &idle,
+			"Seconds with nothing to do before exiting", "SECONDS" },
+		{ "config", 0, 0, G_OPTION_ARG_FILENAME, &config,
+			"Read this config instead of ~/.config/augur/config", "FILE" },
+		{ "version", 0, 0, G_OPTION_ARG_NONE, &version, "Print the version",
+			NULL },
+		{ NULL, 0, 0, 0, NULL, NULL, NULL },
+	};
+	GOptionContext *ctx = g_option_context_new("- Augur's service");
+	g_option_context_add_main_entries(ctx, entries, NULL);
+	GError *error = NULL;
+	if (!g_option_context_parse(ctx, &argc, &argv, &error)) {
+		g_printerr("augurd: %s\n", error->message);
+		return 2;
+	}
+	g_option_context_free(ctx);
+	if (version) {
+		printf("augurd %s\n", AUGUR_VERSION);
+		return 0;
+	}
+
+	/* Watching the config is a local file's business: no gvfs. */
+	g_setenv("GIO_USE_VFS", "local", TRUE);
+	(void)augur_error_quark();
+	srv.loop = g_main_loop_new(NULL, FALSE);
+	srv.info = g_dbus_node_info_new_for_xml(introspection, NULL);
+	srv.requests = g_hash_table_new(NULL, NULL);
+	srv.queues = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+	srv.keys = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+	srv.soup = soup_session_new_with_options("user-agent",
+		"Augur/" AUGUR_VERSION, "timeout", 300, NULL);
+	srv.idle_timeout = stay ? 0 : idle;
+	const char *off = g_getenv("AUGUR_DISABLED");
+	srv.disabled_by_env = off != NULL && off[0] != '\0' && strcmp(off, "0") != 0;
+	srv.enabled = true; /* so the first load's result counts as a change */
+	srv.config_file = config != NULL ? config : config_path();
+	load_config();
+	GFile *file = g_file_new_for_path(srv.config_file);
+	srv.monitor = g_file_monitor_file(file, G_FILE_MONITOR_NONE, NULL, NULL);
+	g_object_unref(file);
+	if (srv.monitor != NULL) {
+		g_signal_connect(srv.monitor, "changed", G_CALLBACK(config_changed), NULL);
+	}
+
+	guint owner = g_bus_own_name(G_BUS_TYPE_SESSION, BUS_NAME,
+		G_BUS_NAME_OWNER_FLAGS_DO_NOT_QUEUE, bus_acquired, name_acquired,
+		name_lost, NULL,
+		NULL);
+	g_unix_signal_add(SIGTERM, on_signal, NULL);
+	g_unix_signal_add(SIGINT, on_signal, NULL);
+	busy(0);
+	g_main_loop_run(srv.loop);
+	g_bus_unown_name(owner);
+	return srv.status;
+}
