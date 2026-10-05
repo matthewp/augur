@@ -5,6 +5,7 @@
  *   augur status                    on or off, and why
  *   augur profiles                  the profiles, and what's wrong with any
  *   augur models [PROFILE]          the models a provider lists
+ *   augur usage [OPTIONS]           requests, tokens and what they cost
  *   augur ask [OPTIONS] [PROMPT]    an answer, as it's written (the prompt
  *                                   from stdin if not given)
  *
@@ -129,6 +130,205 @@ static int cmd_models(const char *profile) {
 	return 0;
 }
 
+/* Dollars: cents for what's over a dollar, else enough places to show it. */
+static char *format_cost(double cost) {
+	if (cost >= 1 || cost == 0) {
+		return g_strdup_printf("$%.2f", cost);
+	}
+	char *s = g_strdup_printf("$%.6f", cost);
+	size_t n = strlen(s);
+	while (n > 5 && s[n - 1] == '0') {   /* $0.00 at least */
+		s[--n] = '\0';
+	}
+	return s;
+}
+
+/* 1234567 as 1,234,567. */
+static char *format_count(gint64 n) {
+	char *digits = g_strdup_printf("%" G_GINT64_FORMAT, n);
+	GString *s = g_string_new(NULL);
+	size_t len = strlen(digits);
+	for (size_t i = 0; i < len; i++) {
+		if (i > 0 && (len - i) % 3 == 0 && digits[i - 1] != '-') {
+			g_string_append_c(s, ',');
+		}
+		g_string_append_c(s, digits[i]);
+	}
+	g_free(digits);
+	return g_string_free(s, FALSE);
+}
+
+/* ---- usage ----------------------------------------------------------------- */
+
+/* A time as the shell says it: today, yesterday, week (the last seven
+ * days), month (since the 1st), year, all, or a date (YYYY-MM-DD). */
+static bool parse_when(const char *when, gint64 *out) {
+	GDateTime *now = g_date_time_new_now_local();
+	GDateTime *today = g_date_time_new_local(g_date_time_get_year(now),
+		g_date_time_get_month(now), g_date_time_get_day_of_month(now), 0, 0, 0);
+	GDateTime *t = NULL;
+	int y, m, d;
+	char extra;
+	if (strcmp(when, "all") == 0) {
+		*out = G_MININT64;
+	} else if (strcmp(when, "today") == 0) {
+		t = g_date_time_ref(today);
+	} else if (strcmp(when, "yesterday") == 0) {
+		t = g_date_time_add_days(today, -1);
+	} else if (strcmp(when, "week") == 0) {
+		t = g_date_time_add_days(today, -6);
+	} else if (strcmp(when, "month") == 0) {
+		t = g_date_time_new_local(g_date_time_get_year(now),
+			g_date_time_get_month(now), 1, 0, 0, 0);
+	} else if (strcmp(when, "year") == 0) {
+		t = g_date_time_new_local(g_date_time_get_year(now), 1, 1, 0, 0, 0);
+	} else if (sscanf(when, "%4d-%2d-%2d%c", &y, &m, &d, &extra) == 3) {
+		t = g_date_time_new_local(y, m, d, 0, 0, 0);
+	}
+	bool ok = t != NULL || strcmp(when, "all") == 0;
+	if (t != NULL) {
+		*out = g_date_time_to_unix(t);
+		g_date_time_unref(t);
+	}
+	g_date_time_unref(today);
+	g_date_time_unref(now);
+	return ok;
+}
+
+static int cmd_usage(int argc, char *argv[]) {
+	char *since = NULL, *until = NULL, *by = NULL, *app = NULL;
+	GOptionEntry entries[] = {
+		{ "since", 0, 0, G_OPTION_ARG_STRING, &since,
+			"From: today, yesterday, week, month (the default), year, all, "
+			"or YYYY-MM-DD", "WHEN" },
+		{ "until", 0, 0, G_OPTION_ARG_STRING, &until,
+			"Up to (not including), the same way", "WHEN" },
+		{ "by", 0, 0, G_OPTION_ARG_STRING, &by,
+			"Added up by app (the default), profile, model or day; or several, "
+			"with commas; or none", "KEYS" },
+		{ "app", 0, 0, G_OPTION_ARG_STRING, &app, "Only this program's", "ID" },
+		{ NULL, 0, 0, 0, NULL, NULL, NULL },
+	};
+	GOptionContext *ctx = g_option_context_new("usage");
+	g_option_context_add_main_entries(ctx, entries, NULL);
+	GError *error = NULL;
+	if (!g_option_context_parse(ctx, &argc, &argv, &error)) {
+		g_printerr("augur: %s\n", error->message);
+		return 2;
+	}
+	g_option_context_free(ctx);
+	gint64 from, to = G_MAXINT64;
+	if (!parse_when(since != NULL ? since : "month", &from) ||
+			(until != NULL && !parse_when(until, &to))) {
+		g_printerr("augur: a time is today, yesterday, week, month, year, all "
+			"or YYYY-MM-DD\n");
+		return 2;
+	}
+	char **keys = strcmp(by != NULL ? by : "app", "none") == 0 ?
+		g_new0(char *, 1) : g_strsplit(by != NULL ? by : "app", ",", -1);
+
+	GVariantBuilder q;
+	g_variant_builder_init(&q, G_VARIANT_TYPE("a{sv}"));
+	g_variant_builder_add(&q, "{sv}", "since", g_variant_new_int64(from));
+	g_variant_builder_add(&q, "{sv}", "until", g_variant_new_int64(to));
+	g_variant_builder_add(&q, "{sv}", "by",
+		g_variant_new_strv((const char *const *)keys, -1));
+	if (app != NULL) {
+		g_variant_builder_add(&q, "{sv}", "app-id", g_variant_new_string(app));
+	}
+	GVariant *r = call("Usage", g_variant_new("(a{sv})", &q), "(aa{sv})", &error);
+	if (r == NULL) {
+		print_error(error);
+		g_error_free(error);
+		g_strfreev(keys);
+		return 1;
+	}
+
+	/* A table: the keys, then the numbers, and a total under several. */
+	GVariant *rows = g_variant_get_child_value(r, 0);
+	gsize n = g_variant_n_children(rows);
+	int nkeys = g_strv_length(keys);
+	GPtrArray *cells = g_ptr_array_new_with_free_func(g_free);
+	gint64 total[5] = { 0 };   /* requests, input, output, cached, unpriced */
+	double total_cost = 0;
+	const char *heads[] = { "requests", "input", "output", "cached", "cost" };
+	for (int k = 0; k < nkeys; k++) {
+		g_ptr_array_add(cells, g_strdup(keys[k]));
+	}
+	for (int i = 0; i < 5; i++) {
+		g_ptr_array_add(cells, g_strdup(heads[i]));
+	}
+	for (gsize i = 0; i <= n; i++) {
+		bool is_total = i == n;
+		if (is_total && n < 2) {
+			break;
+		}
+		gint64 v[5] = { 0 };
+		double cost = 0;
+		if (is_total) {
+			memcpy(v, total, sizeof v);
+			cost = total_cost;
+		} else {
+			GVariant *row = g_variant_get_child_value(rows, i);
+			g_variant_lookup(row, "requests", "x", &v[0]);
+			g_variant_lookup(row, "input-tokens", "x", &v[1]);
+			g_variant_lookup(row, "output-tokens", "x", &v[2]);
+			g_variant_lookup(row, "cached-tokens", "x", &v[3]);
+			g_variant_lookup(row, "unpriced", "x", &v[4]);
+			g_variant_lookup(row, "cost", "d", &cost);
+			for (int k = 0; k < nkeys; k++) {
+				const char *s = "";
+				g_variant_lookup(row, keys[k], "&s", &s);
+				g_ptr_array_add(cells, g_strdup(s[0] != '\0' ? s : "-"));
+			}
+			g_variant_unref(row);
+			for (int j = 0; j < 5; j++) {
+				total[j] += v[j];
+			}
+			total_cost += cost;
+		}
+		for (int k = 0; is_total && k < nkeys; k++) {
+			g_ptr_array_add(cells, g_strdup(k == 0 ? "total" : ""));
+		}
+		for (int j = 0; j < 4; j++) {
+			g_ptr_array_add(cells, format_count(v[j]));
+		}
+		char *c = format_cost(cost);
+		g_ptr_array_add(cells, v[4] > 0 ? g_strdup_printf("%s + %" G_GINT64_FORMAT
+			" unpriced", c, v[4]) : g_strdup(c));
+		g_free(c);
+	}
+	int ncols = nkeys + 5;
+	guint nrows = cells->len / ncols;
+	int *width = g_new0(int, ncols);
+	for (guint i = 0; i < cells->len; i++) {
+		width[i % ncols] = MAX(width[i % ncols],
+			(int)g_utf8_strlen(cells->pdata[i], -1));
+	}
+	for (guint row = 0; n > 0 && row < nrows; row++) {
+		for (int col = 0; col < ncols; col++) {
+			const char *cell = cells->pdata[row * ncols + col];
+			/* Keys to the left; numbers to the right; cost as it is. */
+			if (col < nkeys) {
+				printf("%-*s  ", width[col], cell);
+			} else if (col < ncols - 1) {
+				printf("%*s  ", width[col], cell);
+			} else {
+				printf("%s\n", cell);
+			}
+		}
+	}
+	if (n == 0) {
+		printf("nothing asked\n");
+	}
+	g_free(width);
+	g_ptr_array_unref(cells);
+	g_variant_unref(rows);
+	g_variant_unref(r);
+	g_strfreev(keys);
+	return 0;
+}
+
 /* ---- ask ------------------------------------------------------------------- */
 
 static struct {
@@ -157,10 +357,16 @@ static void print_info(GVariant *info) {
 	g_variant_lookup(info, "tool-calls", "i", &calls);
 	char *tools = calls > 0 ? g_strdup_printf(", %d tool call%s in %d rounds",
 		calls, calls == 1 ? "" : "s", rounds) : g_strdup("");
+	double cost = -1;
+	g_variant_lookup(info, "cost", "d", &cost);
+	char *c = cost >= 0 ? format_cost(cost) : NULL;
+	char *costs = c != NULL ? g_strdup_printf(", %s", c) : g_strdup("");
 	g_printerr("[%s, %s: %" G_GINT64_FORMAT " in, %" G_GINT64_FORMAT
-		" out%s%s]\n", profile, model, in, out, attempts > 1 ? ", asked twice" : "",
-		tools);
+		" out%s%s%s]\n", profile, model, in, out, costs,
+		attempts > 1 ? ", asked twice" : "", tools);
 	g_free(tools);
+	g_free(costs);
+	g_free(c);
 }
 
 /* ---- ask: tools ------------------------------------------------------------ */
@@ -463,6 +669,7 @@ static void usage(FILE *to) {
 	fputs("Usage: augur status\n"
 		"       augur profiles\n"
 		"       augur models [PROFILE]\n"
+		"       augur usage [--since WHEN] [--until WHEN] [--by KEYS] [--app ID]\n"
 		"       augur ask [-p PROFILE] [-m MODEL] [-t TIER] [-s SYSTEM]\n"
 		"                 [--schema JSON|@FILE] [--tools FILE] [--max-rounds N]\n"
 		"                 [--no-stream] [-v] [PROMPT...]\n"
@@ -498,6 +705,9 @@ int main(int argc, char *argv[]) {
 	}
 	if (strcmp(cmd, "ask") == 0) {
 		return cmd_ask(argc - 1, argv + 1);
+	}
+	if (strcmp(cmd, "usage") == 0) {
+		return cmd_usage(argc - 1, argv + 1);
 	}
 	g_printerr("augur: no command \"%s\"\n", cmd);
 	usage(stderr);

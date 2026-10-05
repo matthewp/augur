@@ -20,6 +20,12 @@ enum structured {
 	STRUCTURED_PROMPT,    /* the schema in the prompt, the answer checked */
 };
 
+/* A model's price, in US dollars per million tokens. */
+struct price {
+	double input, output;
+	double cached;            /* input read from the provider's cache */
+};
+
 struct profile {
 	char *name;
 	char *provider;           /* as written: openai, cloudflare, ... */
@@ -31,6 +37,7 @@ struct profile {
 	bool needs_key;
 	char *model;              /* when nothing more particular is asked */
 	GHashTable *tiers;        /* name -> model */
+	GHashTable *prices;       /* model -> struct price */
 	enum structured structured;
 	bool stream_usage;        /* ask for token counts in a stream */
 	int max_concurrent;

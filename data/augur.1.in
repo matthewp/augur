@@ -9,6 +9,16 @@ augur \- ask Augur, the desktop's AI service, from the shell
 .B augur models
 .RI [ PROFILE ]
 .br
+.B augur usage
+.RB [ \-\-since
+.IR WHEN ]
+.RB [ \-\-until
+.IR WHEN ]
+.RB [ \-\-by
+.IR KEYS ]
+.RB [ \-\-app
+.IR ID ]
+.br
 .B augur ask
 .RB [ \-p
 .IR PROFILE ]
@@ -54,6 +64,32 @@ wrong with any that can't be used.
 .BR models " [\fIPROFILE\fR]"
 The models the profile's provider lists (the default profile's if none
 is named).
+.TP
+.BR usage " [\fIOPTIONS\fR]"
+Requests, tokens and what they cost, from the log: this month's, by
+program, unless the options say otherwise.
+.I WHEN
+is
+.BR today ", " yesterday ", " week
+(the last seven days),
+.B month
+(since the 1st),
+.BR year ", " all ,
+or a date,
+.IR YYYY\-MM\-DD ;
+.B \-\-until
+isn't included.
+.B \-\-by
+adds up by
+.BR app ", " profile ", " model
+or
+.BR day ,
+or several with commas, or
+.BR none .
+A cost is what the provider said it charged, or the tokens at the
+profile's
+.BI price. MODEL
+from the config; requests with neither are counted as unpriced.
 .TP
 .BR ask " [\fIOPTIONS\fR] [\fIPROMPT\fR...]"
 Asks, and prints the answer as it's written.
@@ -126,7 +162,8 @@ See the README for all of it.
 The configuration.
 .TP
 .I ~/.local/state/augur/log
-What was asked of whom: app, profile, model and tokens, never the text.
+What was asked of whom: app, profile, model, tokens and cost, never the
+text.
 .SH ENVIRONMENT
 .TP
 .B AUGUR_DISABLED

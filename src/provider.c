@@ -30,7 +30,8 @@ struct call {
 	GString *body;        /* an error's body */
 	char *stream_error;   /* an error sent in the stream */
 	enum call_error stream_error_kind;
-	gint64 input_tokens, output_tokens;
+	gint64 input_tokens, output_tokens, cached_tokens;
+	double cost;
 	call_delta_fn delta;
 	call_done_fn done;
 	void *data;
@@ -495,7 +496,7 @@ static JsonArray *calls_of(struct call *c) {
 
 static void finish(struct call *c, enum call_error error, char *message) {
 	struct call_result r = { error, message, NULL, NULL, c->input_tokens,
-		c->output_tokens };
+		c->output_tokens, c->cached_tokens, c->cost };
 	if (error == CALL_OK) {
 		r.text = g_string_free(c->text, FALSE);
 		c->text = NULL;
@@ -668,6 +669,16 @@ static void openai_event(struct call *c, JsonObject *o) {
 			"prompt_tokens", c->input_tokens);
 		c->output_tokens = json_object_get_int_member_with_default(u,
 			"completion_tokens", c->output_tokens);
+		JsonNode *details = json_object_get_member(u, "prompt_tokens_details");
+		if (details != NULL && JSON_NODE_HOLDS_OBJECT(details)) {
+			c->cached_tokens = json_object_get_int_member_with_default(
+				json_node_get_object(details), "cached_tokens", c->cached_tokens);
+		}
+		/* OpenRouter's: what it charged. */
+		JsonNode *cost = json_object_get_member(u, "cost");
+		if (cost != NULL && JSON_NODE_HOLDS_VALUE(cost)) {
+			c->cost = json_node_get_double(cost);
+		}
 	}
 }
 
@@ -678,8 +689,18 @@ static void anthropic_event(struct call *c, JsonObject *o) {
 		JsonObject *u = m != NULL && json_object_has_member(m, "usage") ?
 			json_object_get_object_member(m, "usage") : NULL;
 		if (u != NULL) {
+			/* Anthropic counts what was read from and written to its cache
+			 * apart from the rest; Augur counts them all as input, as
+			 * OpenAI does, with what was read also as cached. */
+			gint64 read = json_object_get_int_member_with_default(u,
+				"cache_read_input_tokens", 0);
 			c->input_tokens = json_object_get_int_member_with_default(u,
 				"input_tokens", -1);
+			if (c->input_tokens >= 0) {
+				c->input_tokens += read + json_object_get_int_member_with_default(u,
+					"cache_creation_input_tokens", 0);
+				c->cached_tokens = read;
+			}
 		}
 	} else if (strcmp(type, "content_block_start") == 0) {
 		JsonObject *cb = json_object_has_member(o, "content_block") ?
@@ -821,7 +842,8 @@ void call_start(SoupSession *session, const struct call_spec *spec,
 	c->kind = spec->profile->kind;
 	c->text = g_string_new(NULL);
 	c->calls = g_ptr_array_new_with_free_func(tool_call_free);
-	c->input_tokens = c->output_tokens = -1;
+	c->input_tokens = c->output_tokens = c->cached_tokens = -1;
+	c->cost = -1;
 	c->delta = delta;
 	c->done = done;
 	c->data = data;

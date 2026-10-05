@@ -38,6 +38,8 @@ struct call_result {
 	JsonArray *calls;         /* the tools it called (objects: id, name,
 	                           * arguments, as JSON text), or NULL */
 	gint64 input_tokens, output_tokens; /* -1 if not said */
+	gint64 cached_tokens;     /* of the input, read from a cache; -1 */
+	double cost;              /* dollars, if the provider said; else -1 */
 };
 
 /* Besides system, user and assistant messages (role, content), a

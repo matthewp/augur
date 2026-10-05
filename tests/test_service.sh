@@ -57,6 +57,7 @@ url = $URL
 api-key-command = echo sk-test
 model = model-main
 tier.fast = model-fast
+price.model-main = 1 2
 
 [profile plain]
 provider = openai-compatible
@@ -68,6 +69,13 @@ provider = anthropic
 url = $URL
 api-key-command = echo sk-ant-test
 model = claude-test
+price.claude-test = 3 15 0.3
+
+[profile router]
+provider = openrouter
+url = $URL
+api-key-command = echo sk-test
+model = router-model
 
 [profile wrongkey]
 provider = openai
@@ -207,6 +215,39 @@ wait "$ASKER"
 sleep 0.5
 contains "cancelling while a tool runs" '"tools":["slowtool"],"result":"Cancelled"' "$(tail -n 1 "$LOG")"
 contains "the log names the tools" '"rounds":2,"tools":["weather"]' "$(cat "$LOG")"
+
+# ---- Usage and spend ----------------------------------------------------------
+U="--app-id usage.test"
+out=$("$AUGUR" ask -v $U hi 2>&1 >/dev/null)
+contains "a price from the config" '11 in, 3 out, $0.000017]' "$out"
+"$AUGUR" ask $U hi > /dev/null
+out=$("$AUGUR" ask -v $U -p router hi 2>&1 >/dev/null)
+contains "the cost OpenRouter says" '$0.0005]' "$out"
+out=$("$AUGUR" ask -v $U -m unpriced-model hi 2>&1 >/dev/null)
+case "$out" in *'$'*) fail "no price, no cost: $out" ;; *) pass "no price, no cost" ;; esac
+out=$("$AUGUR" ask -v $U -p claude hi 2>&1 >/dev/null)
+contains "anthropic: cache reads count as input, at their own price" '25 in, 5 out, $0.000139]' "$out"
+contains "the log has the cost" '"cached-tokens":4,"cost":0.0001392' "$(tail -n 1 "$LOG")"
+usage=$("$AUGUR" usage --app usage.test --by model --since today | tr -s ' ')
+contains "usage by model" 'model-main 2 22 6 0 $0.000034' "$usage"
+contains "... OpenRouter's" 'router-model 1 11 3 0 $0.0005' "$usage"
+contains "... unpriced said so" '$0.00 + 1 unpriced' "$usage"
+"$AUGUR" ask -p plain hi > /dev/null
+expect "no token counts asked of a compatible server" "False" "$(last_request | field '"stream_options" in r["body"]')"
+printf '\n[profile counted]\nprovider = openai-compatible\nurl = %s\nmodel = m\nstream-usage = true\nprice.m = 1 2\n' "$URL" >> "$CONFIG"
+sleep 1
+out=$("$AUGUR" ask -v -p counted hi 2>&1 >/dev/null)
+contains "... unless the profile says it takes them" '11 in, 3 out, $0.000017]' "$out"
+contains "... a total" 'total 5 69 17 4 $0.000673 + 1 unpriced' "$usage"
+expect "usage for no one" "nothing asked" "$("$AUGUR" usage --app no.one)"
+expect "usage before it all" "nothing asked" "$("$AUGUR" usage --until 2001-01-01 --since all)"
+out=$("$AUGUR" usage --by colour 2>&1)
+contains "usage by something unknown" "not \"colour\"" "$out"
+sed -i 's/^price.model-main = 1 2$/price.model-main = 1 two/' "$CONFIG"
+sleep 1
+contains "a bad price says so" "price.model-main isn't two or three numbers" "$("$AUGUR" profiles)"
+sed -i 's/^price.model-main = 1 two$/price.model-main = 1 2/' "$CONFIG"
+sleep 1
 
 # ---- Errors -----------------------------------------------------------------
 out=$("$AUGUR" ask rate 2>&1); status=$?

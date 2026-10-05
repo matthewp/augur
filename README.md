@@ -50,6 +50,8 @@ Then write `~/.config/augur/config` (below) and ask it something:
     augur ask --schema '{"type":"object","properties":{"mood":{"enum":["happy","sad"]}},"required":["mood"]}' "I lost my keys"
     echo "a prompt from stdin" | augur ask -v    # -v: the model and tokens
     augur ask --tools tools.json "What's the weather in Paris?"
+    augur usage                  # this month's requests, tokens and cost, by app
+    augur usage --since week --by model,day
 
 A tools file is a JSON array of `{name, description, schema, command}`: a
 call's arguments go to the command on stdin, what it prints is the result,
@@ -142,6 +144,8 @@ A profile's settings:
 | `tier.NAME` | a model for the tier NAME |
 | `structured-output` | `native` (the provider's own) or `prompt` (the schema in the prompt); the default suits the provider |
 | `max-concurrent` | requests to it at once (4) |
+| `stream-usage` | `true` to ask for token counts in a stream (`stream_options`); it's on for OpenAI, OpenRouter and Anthropic, and off for the rest, which may not take it. Without token counts, a request can't be priced |
+| `price.MODEL` | what MODEL costs, in US dollars per million tokens: input and output, and cached input if it's cheaper (e.g. `3 15 0.3`) |
 
 A `#` after a value, with a space before it, starts a comment.
 
@@ -150,6 +154,13 @@ OpenAI's chat completions (`openai`, `openrouter`, `cloudflare`, `ollama`,
 and `openai-compatible` with a `url` for anything else); Anthropic gets its
 own adapter for its Messages API. A provider adapter turns a request into
 the provider's HTTP, and its replies (whole or streamed) back.
+
+**What it costs.** Augur counts every request's tokens, and its cost in
+dollars: what the provider says it charged where it says (OpenRouter
+does), else the tokens at the profile's `price.` for the model. A model
+with neither is counted as unpriced, never guessed at. Prices change, so
+Augur has none of its own: they're in your config, from the provider's
+price list.
 
 **Tiers** are names a profile gives to models, as many as you like (`cheap`,
 `cheaper`, `smart`, `vision`...). They're shortcuts, not a ladder every
@@ -202,6 +213,8 @@ interface io.github.matthewp.Augur1
                                     # name, provider, problem ("" if usable), tiers
   method ListModels(profile: s) -> (models: as)
                                     # what the provider lists ("": the default profile)
+  method Usage(query: a{sv}) -> (rows: aa{sv})
+                                    # the log, added up: see below
 
 interface io.github.matthewp.Augur1.Request     (on each handle)
 
@@ -234,8 +247,16 @@ A request (`a{sv}`):
 
 `info` in `Done` and `Ask`: `profile` (s), `model` (s), `attempts` (i: 2
 if a structured answer was asked for again), `rounds` (i: times the
-model was asked), `tool-calls` (i), and `input-tokens` and `output-tokens`
-(x, over every round) when the provider said.
+model was asked), `tool-calls` (i); `input-tokens`, `output-tokens` and
+`cached-tokens` (x: of the input, read from the provider's cache) over
+every round, when the provider said; and `cost` (d, US dollars) when
+it's known.
+
+`Usage` adds up the log. Its query: `since` and `until` (x, seconds
+since 1970; until isn't included), `app-id` (s), and `by` (as: any of
+`app`, `profile`, `model`, `day`). Each row has what it's by, and
+`requests`, `input-tokens`, `output-tokens`, `cached-tokens` (x), `cost`
+(d: what's known) and `unpriced` (x: requests whose cost isn't).
 
 Signals for a request go to the program that made it alone (D-Bus unicast
 signals), never to the bus at large. Subscribe to them (sender
@@ -299,8 +320,10 @@ message), `Schema`, `Cancelled`. A malformed request is
 - The config is read again when it changes; `Enabled` follows, signalled.
 - Keys are fetched by running the command when first needed and kept in
   memory, never written anywhere.
-- A log of what was asked of whom (app, profile, model, tokens; not the
-  text) in `~/.local/state/augur/log`, for "what's this costing me".
+- A log of what was asked of whom (app, profile, model, tokens, cost;
+  not the text) in `~/.local/state/augur/log`, a line of JSON each, for
+  "what's this costing me": `augur usage` and the `Usage` method add it
+  up.
 
 ## First user: GemMail's categories (next)
 
@@ -338,7 +361,8 @@ out.)
   schema is for structured answers: the answer either a call or the
   final one. For now such a provider's error is `Error.Provider`.
 - **Spending limits** per app or per day: worth having before anything runs
-  unattended for long, more so with tools, where one request is several;
-  `max-rounds` and the log are the start of it.
+  unattended for long, more so with tools, where one request is several.
+  The costs are counted now; a limit would refuse requests past it with
+  an error of its own.
 - **Model lists**: providers that list models make `ListModels` easy; for
   the rest, it's what the profile names.

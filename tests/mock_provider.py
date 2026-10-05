@@ -147,8 +147,10 @@ class Handler(BaseHTTPRequestHandler):
             if "slow" in prompt:
                 time.sleep(0.25)
         if body.get("stream_options", {}).get("include_usage"):
-            self.event({"choices": [], "usage": {"prompt_tokens": 11,
-                                                 "completion_tokens": 3}})
+            usage = {"prompt_tokens": 11, "completion_tokens": 3}
+            if self.headers.get("X-Title") == "Augur":
+                usage["cost"] = 0.0005   # OpenRouter says what it charged
+            self.event({"choices": [], "usage": usage})
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
 
@@ -190,7 +192,9 @@ class Handler(BaseHTTPRequestHandler):
         prompt = last_user(messages)
         self.start_stream()
         self.event({"type": "message_start",
-                    "message": {"usage": {"input_tokens": 21}}}, "message_start")
+                    "message": {"usage": {"input_tokens": 21,
+                                          "cache_read_input_tokens": 4}}},
+                   "message_start")
         tools = body.get("tools") or []
         mine = [t for t in tools if t["name"] != "answer"]
         answer = [t for t in tools if t["name"] == "answer"]

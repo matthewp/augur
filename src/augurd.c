@@ -58,6 +58,10 @@ static const char introspection[] =
 	"   <arg name='profile' type='s' direction='in'/>"
 	"   <arg name='models' type='as' direction='out'/>"
 	"  </method>"
+	"  <method name='Usage'>"
+	"   <arg name='query' type='a{sv}' direction='in'/>"
+	"   <arg name='rows' type='aa{sv}' direction='out'/>"
+	"  </method>"
 	" </interface>"
 	" <interface name='" REQUEST_IFACE "'>"
 	"  <signal name='Delta'><arg name='text' type='s'/></signal>"
@@ -139,7 +143,9 @@ struct request {
 	bool running;         /* has its place: out of the queue */
 	bool sender_gone;     /* no one to tell */
 	int attempts;
-	gint64 input_tokens, output_tokens;
+	gint64 input_tokens, output_tokens, cached_tokens;
+	double cost;          /* dollars, over every round */
+	bool cost_unknown;    /* a round's cost couldn't be known */
 	GCancellable *cancel;
 };
 
@@ -272,6 +278,14 @@ static void log_request(struct request *r, const char *result) {
 	json_builder_add_int_value(b, r->input_tokens);
 	json_builder_set_member_name(b, "output-tokens");
 	json_builder_add_int_value(b, r->output_tokens);
+	json_builder_set_member_name(b, "cached-tokens");
+	json_builder_add_int_value(b, r->cached_tokens);
+	json_builder_set_member_name(b, "cost");
+	if (r->cost_unknown) {
+		json_builder_add_null_value(b);
+	} else {
+		json_builder_add_double_value(b, r->cost);
+	}
 	json_builder_set_member_name(b, "attempts");
 	json_builder_add_int_value(b, r->attempts);
 	if (r->tools != NULL) {
@@ -373,6 +387,13 @@ static GVariant *info_of(struct request *r) {
 	if (r->output_tokens >= 0) {
 		g_variant_builder_add(&b, "{sv}", "output-tokens",
 			g_variant_new_int64(r->output_tokens));
+	}
+	if (r->cached_tokens >= 0) {
+		g_variant_builder_add(&b, "{sv}", "cached-tokens",
+			g_variant_new_int64(r->cached_tokens));
+	}
+	if (!r->cost_unknown) {
+		g_variant_builder_add(&b, "{sv}", "cost", g_variant_new_double(r->cost));
 	}
 	g_variant_builder_add(&b, "{sv}", "attempts",
 		g_variant_new_int32(r->attempts));
@@ -568,6 +589,25 @@ static void tool_answer(struct request *r, GVariant *params, bool error,
 	}
 }
 
+/* What a round cost: what the provider said, else its tokens at the
+ * profile's price for the model; -1 if neither can be known. */
+static double cost_of(struct request *r, struct call_result *result) {
+	if (result->cost >= 0) {
+		return result->cost;
+	}
+	if (result->input_tokens < 0 && result->output_tokens < 0 &&
+			result->error != CALL_OK && result->error != CALL_CANCELLED) {
+		return 0;   /* refused before it began: nothing used */
+	}
+	const struct price *p = g_hash_table_lookup(r->profile->prices, r->model);
+	if (p == NULL || result->input_tokens < 0 || result->output_tokens < 0) {
+		return -1;
+	}
+	gint64 cached = CLAMP(result->cached_tokens, 0, result->input_tokens);
+	return ((result->input_tokens - cached) * p->input + cached * p->cached +
+		result->output_tokens * p->output) / 1e6;
+}
+
 static void answered(struct call_result *result, void *data) {
 	struct request *r = data;
 	if (result->input_tokens >= 0) {
@@ -575,6 +615,15 @@ static void answered(struct call_result *result, void *data) {
 	}
 	if (result->output_tokens >= 0) {
 		r->output_tokens = MAX(r->output_tokens, 0) + result->output_tokens;
+	}
+	if (result->cached_tokens >= 0) {
+		r->cached_tokens = MAX(r->cached_tokens, 0) + result->cached_tokens;
+	}
+	double cost = cost_of(r, result);
+	if (cost < 0) {
+		r->cost_unknown = true;
+	} else {
+		r->cost += cost;
 	}
 	if (result->error != CALL_OK) {
 		if (result->error == CALL_AUTH) {
@@ -920,7 +969,7 @@ static struct request *request_new(GVariant *params, const char *sender,
 	struct request *r = g_new0(struct request, 1);
 	r->config = config_ref(srv.config);
 	r->sender = g_strdup(sender);
-	r->input_tokens = r->output_tokens = -1;
+	r->input_tokens = r->output_tokens = r->cached_tokens = -1;
 	r->temperature = -1;
 	r->messages = json_array_new();
 	r->waiting = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
@@ -1119,6 +1168,168 @@ static void list_models(GVariant *params, GDBusMethodInvocation *inv) {
 	call_list_models(srv.soup, p, key, models_listed, m);
 }
 
+/* ---- Usage: the log, added up ---------------------------------------------- */
+
+struct usage_row {
+	char *key[4];          /* app, profile, model, day: those grouped by */
+	gint64 requests, input, output, cached, unpriced;
+	double cost;
+};
+
+static const char *usage_keys[] = { "app", "profile", "model", "day" };
+
+static void usage_row_free(gpointer data) {
+	struct usage_row *row = data;
+	for (int i = 0; i < 4; i++) {
+		g_free(row->key[i]);
+	}
+	g_free(row);
+}
+
+static int usage_row_compare(gconstpointer a, gconstpointer b) {
+	const struct usage_row *x = a, *y = b;
+	for (int i = 0; i < 4; i++) {
+		int c = g_strcmp0(x->key[i], y->key[i]);
+		if (c != 0) {
+			return c;
+		}
+	}
+	return 0;
+}
+
+/* Usage(query) -> rows: the log's requests from since (x, seconds since
+ * 1970) until before until, perhaps one app's, added up by what "by"
+ * (as) names. */
+static void usage(GVariant *params, GDBusMethodInvocation *inv) {
+	GVariant *query = g_variant_get_child_value(params, 0);
+	gint64 since = G_MININT64, until = G_MAXINT64;
+	const char *app = NULL;
+	const char **by = NULL;
+	g_variant_lookup(query, "since", "x", &since);
+	g_variant_lookup(query, "until", "x", &until);
+	g_variant_lookup(query, "app-id", "&s", &app);
+	g_variant_lookup(query, "by", "^a&s", &by);
+	bool group[4] = { false };
+	for (int i = 0; by != NULL && by[i] != NULL; i++) {
+		bool known = false;
+		for (int k = 0; k < 4; k++) {
+			if (strcmp(by[i], usage_keys[k]) == 0) {
+				group[k] = known = true;
+			}
+		}
+		if (!known) {
+			g_dbus_method_invocation_return_error(inv, G_DBUS_ERROR,
+				G_DBUS_ERROR_INVALID_ARGS,
+				"usage can be by app, profile, model and day, not \"%s\"", by[i]);
+			g_free(by);
+			g_variant_unref(query);
+			return;
+		}
+	}
+	g_free(by);
+
+	GHashTable *rows = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
+		usage_row_free);
+	char *path = g_build_filename(g_get_user_state_dir(), "augur", "log", NULL);
+	char *text = NULL;
+	g_file_get_contents(path, &text, NULL, NULL);
+	g_free(path);
+	char **lines = g_strsplit(text != NULL ? text : "", "\n", -1);
+	g_free(text);
+	JsonParser *parser = json_parser_new();
+	for (int i = 0; lines[i] != NULL; i++) {
+		if (lines[i][0] == '\0' ||
+				!json_parser_load_from_data(parser, lines[i], -1, NULL) ||
+				!JSON_NODE_HOLDS_OBJECT(json_parser_get_root(parser))) {
+			continue;
+		}
+		JsonObject *o = json_node_get_object(json_parser_get_root(parser));
+		GDateTime *t = g_date_time_new_from_iso8601(
+			json_object_get_string_member_with_default(o, "time", ""), NULL);
+		if (t == NULL) {
+			continue;
+		}
+		gint64 when = g_date_time_to_unix(t);
+		GDateTime *local = g_date_time_to_local(t);
+		char *day = g_date_time_format(local, "%Y-%m-%d");
+		g_date_time_unref(local);
+		g_date_time_unref(t);
+		const char *values[4] = {
+			json_object_get_string_member_with_default(o, "app", ""),
+			json_object_get_string_member_with_default(o, "profile", ""),
+			json_object_get_string_member_with_default(o, "model", ""),
+			day,
+		};
+		if (when < since || when >= until ||
+				(app != NULL && strcmp(app, values[0]) != 0)) {
+			g_free(day);
+			continue;
+		}
+		GString *key = g_string_new(NULL);
+		for (int k = 0; k < 4; k++) {
+			g_string_append_printf(key, "%s\x01", group[k] ? values[k] : "");
+		}
+		struct usage_row *row = g_hash_table_lookup(rows, key->str);
+		if (row == NULL) {
+			row = g_new0(struct usage_row, 1);
+			for (int k = 0; k < 4; k++) {
+				row->key[k] = group[k] ? g_strdup(values[k]) : NULL;
+			}
+			g_hash_table_insert(rows, g_strdup(key->str), row);
+		}
+		g_string_free(key, TRUE);
+		g_free(day);
+		row->requests++;
+		row->input += MAX(json_object_get_int_member_with_default(o,
+			"input-tokens", 0), 0);
+		row->output += MAX(json_object_get_int_member_with_default(o,
+			"output-tokens", 0), 0);
+		row->cached += MAX(json_object_get_int_member_with_default(o,
+			"cached-tokens", 0), 0);
+		/* Logged before costs were, or with no price: unpriced. */
+		JsonNode *cost = json_object_get_member(o, "cost");
+		if (cost != NULL && JSON_NODE_HOLDS_VALUE(cost)) {
+			row->cost += json_node_get_double(cost);
+		} else {
+			row->unpriced++;
+		}
+	}
+	g_object_unref(parser);
+	g_strfreev(lines);
+
+	GList *sorted = g_list_sort(g_hash_table_get_values(rows),
+		usage_row_compare);
+	GVariantBuilder b;
+	g_variant_builder_init(&b, G_VARIANT_TYPE("aa{sv}"));
+	for (GList *l = sorted; l != NULL; l = l->next) {
+		struct usage_row *row = l->data;
+		GVariantBuilder r;
+		g_variant_builder_init(&r, G_VARIANT_TYPE("a{sv}"));
+		for (int k = 0; k < 4; k++) {
+			if (row->key[k] != NULL) {
+				g_variant_builder_add(&r, "{sv}", usage_keys[k],
+					g_variant_new_string(row->key[k]));
+			}
+		}
+		g_variant_builder_add(&r, "{sv}", "requests",
+			g_variant_new_int64(row->requests));
+		g_variant_builder_add(&r, "{sv}", "input-tokens",
+			g_variant_new_int64(row->input));
+		g_variant_builder_add(&r, "{sv}", "output-tokens",
+			g_variant_new_int64(row->output));
+		g_variant_builder_add(&r, "{sv}", "cached-tokens",
+			g_variant_new_int64(row->cached));
+		g_variant_builder_add(&r, "{sv}", "cost", g_variant_new_double(row->cost));
+		g_variant_builder_add(&r, "{sv}", "unpriced",
+			g_variant_new_int64(row->unpriced));
+		g_variant_builder_add_value(&b, g_variant_builder_end(&r));
+	}
+	g_list_free(sorted);
+	g_hash_table_unref(rows);
+	g_variant_unref(query);
+	g_dbus_method_invocation_return_value(inv, g_variant_new("(aa{sv})", &b));
+}
+
 static GVariant *status(void) {
 	GVariantBuilder b;
 	g_variant_builder_init(&b, G_VARIANT_TYPE("a{sv}"));
@@ -1201,6 +1412,8 @@ static void method(GDBusConnection *bus, const char *sender, const char *path,
 			g_variant_new("(@a(sssas))", profiles()));
 	} else if (strcmp(name, "ListModels") == 0) {
 		list_models(params, inv);
+	} else if (strcmp(name, "Usage") == 0) {
+		usage(params, inv);
 	}
 }
 

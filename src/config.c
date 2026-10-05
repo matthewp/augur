@@ -37,6 +37,7 @@ static void profile_free(gpointer p) {
 	g_free(pr->gateway_key_command);
 	g_free(pr->model);
 	g_hash_table_unref(pr->tiers);
+	g_hash_table_unref(pr->prices);
 	g_free(pr->problem);
 	g_free(pr);
 }
@@ -70,11 +71,42 @@ static char *value(GKeyFile *kf, const char *group, const char *key) {
 	return v;
 }
 
+/* "IN OUT [CACHED]": dollars per million tokens. Cached input, not
+ * given, is priced as input: more than it costs, never less. */
+static struct price *parse_price(const char *v) {
+	char **parts = g_strsplit_set(v, " \t", -1);
+	double n[3];
+	int count = 0;
+	bool ok = true;
+	for (int i = 0; parts[i] != NULL && ok; i++) {
+		if (parts[i][0] == '\0') {
+			continue;
+		}
+		char *end;
+		double d = g_ascii_strtod(parts[i], &end);
+		ok = count < 3 && *end == '\0' && end != parts[i] && d >= 0;
+		if (ok) {
+			n[count++] = d;
+		}
+	}
+	g_strfreev(parts);
+	if (!ok || count < 2) {
+		return NULL;
+	}
+	struct price *p = g_new(struct price, 1);
+	p->input = n[0];
+	p->output = n[1];
+	p->cached = count == 3 ? n[2] : n[0];
+	return p;
+}
+
 static struct profile *profile_load(GKeyFile *kf, const char *group,
 		const char *name) {
 	struct profile *p = g_new0(struct profile, 1);
 	p->name = g_strdup(name);
 	p->tiers = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+	p->prices = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+	char *bad_price = NULL;
 	p->provider = value(kf, group, "provider");
 	p->model = value(kf, group, "model");
 	p->key_command = value(kf, group, "api-key-command");
@@ -94,6 +126,15 @@ static struct profile *profile_load(GKeyFile *kf, const char *group,
 			if (model != NULL) {
 				g_hash_table_insert(p->tiers, g_strdup(keys[i] + 5), model);
 			}
+		} else if (g_str_has_prefix(keys[i], "price.") && keys[i][6] != '\0') {
+			char *v = value(kf, group, keys[i]);
+			struct price *price = v != NULL ? parse_price(v) : NULL;
+			if (price != NULL) {
+				g_hash_table_insert(p->prices, g_strdup(keys[i] + 6), price);
+			} else if (bad_price == NULL) {
+				bad_price = g_strdup(keys[i]);
+			}
+			g_free(v);
 		}
 	}
 	g_strfreev(keys);
@@ -108,6 +149,7 @@ static struct profile *profile_load(GKeyFile *kf, const char *group,
 		p->problem = p->provider == NULL ? g_strdup("no provider") :
 			g_strdup_printf("unknown provider \"%s\"", p->provider);
 		g_free(url);
+		g_free(bad_price);
 		return p;
 	}
 	p->kind = k->kind;
@@ -134,6 +176,15 @@ static struct profile *profile_load(GKeyFile *kf, const char *group,
 		p->url[strlen(p->url) - 1] = '\0';
 	}
 
+	/* Token counts in a stream are asked for with a field that not every
+	 * OpenAI-compatible server takes; a profile can say its does. */
+	char *usage = value(kf, group, "stream-usage");
+	if (usage != NULL) {
+		p->stream_usage = g_ascii_strcasecmp(usage, "true") == 0 ||
+			g_ascii_strcasecmp(usage, "yes") == 0 || strcmp(usage, "1") == 0;
+		g_free(usage);
+	}
+
 	char *structured = value(kf, group, "structured-output");
 	if (structured != NULL) {
 		p->structured = strcmp(structured, "prompt") == 0 ? STRUCTURED_PROMPT :
@@ -148,7 +199,12 @@ static struct profile *profile_load(GKeyFile *kf, const char *group,
 		p->problem = g_strdup("no model");
 	} else if (p->needs_key && p->key_command == NULL && p->key_env == NULL) {
 		p->problem = g_strdup("no api-key-command or api-key-env");
+	} else if (bad_price != NULL) {
+		p->problem = g_strdup_printf("%s isn't two or three numbers: "
+			"dollars per million input and output (and cached input) tokens",
+			bad_price);
 	}
+	g_free(bad_price);
 	return p;
 }
 
