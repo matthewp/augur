@@ -1,0 +1,79 @@
+# Every push and pull request: the release tarball (meson dist builds and
+# tests it) and the .debs, each built and tested on the system it's for.
+# A tag vX.Y.Z also makes the GitHub release, with all of them attached.
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  dist:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends meson pkgconf \
+            libglib2.0-dev libjson-glib-dev libsoup-3.0-dev \
+            libglib2.0-bin dbus-bin dbus-daemon python3
+      - run: meson setup build
+      - run: meson dist -C build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: build/meson-dist/*.tar.xz
+
+  deb:
+    strategy:
+      fail-fast: false
+      matrix:
+        system:
+          - { image: 'debian:bookworm', name: debian12 }
+          - { image: 'debian:trixie', name: debian13 }
+          - { image: 'ubuntu:noble', name: ubuntu24.04 }
+        arch:
+          - { runner: ubuntu-24.04, name: amd64 }
+          - { runner: ubuntu-24.04-arm, name: arm64 }
+    runs-on: ${{ matrix.arch.runner }}
+    container: ${{ matrix.system.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: build-aux/build-deb.sh debs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.system.name }}-${{ matrix.arch.name }}
+          path: debs/*.deb
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [dist, deb]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: The tag is the version
+        run: |
+          version=$(sed -n "s/^\tversion: '\(.*\)',/\1/p" meson.build)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "the tag is $GITHUB_REF_NAME but meson.build says $version" >&2
+            exit 1
+          fi
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - run: cd out && sha256sum * > SHA256SUMS
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" out/* \
+            --title "Augur ${GITHUB_REF_NAME#v}" --generate-notes

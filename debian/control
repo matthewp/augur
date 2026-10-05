@@ -1,0 +1,37 @@
+Source: augur
+Section: utils
+Priority: optional
+Maintainer: Matthew Phillips <matthew@matthewphillips.info>
+Build-Depends:
+ debhelper-compat (= 13),
+ meson (>= 1.0.0),
+ pkgconf,
+ libglib2.0-dev (>= 2.74),
+ libjson-glib-dev,
+ libsoup-3.0-dev,
+ dbus-bin <!nocheck>,
+ dbus-daemon <!nocheck>,
+ libglib2.0-bin <!nocheck>,
+ python3 <!nocheck>,
+Standards-Version: 4.7.0
+Homepage: https://github.com/matthewp/augur
+Vcs-Browser: https://github.com/matthewp/augur
+Vcs-Git: https://github.com/matthewp/augur.git
+Rules-Requires-Root: no
+
+Package: augur
+Architecture: any
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends},
+ default-dbus-session-bus | dbus-session-bus,
+Description: AI for desktop programs, as a session D-Bus service
+ Augur gives desktop applications AI without each of them talking to AI
+ providers. A program asks Augur over D-Bus; Augur knows the providers
+ (OpenAI, Anthropic, OpenRouter, Cloudflare AI Gateway, Ollama and any
+ OpenAI-compatible API), the keys, which model to use, and how to get a
+ well-formed answer out of each: streamed text, JSON checked against a
+ schema, and tools the model can call back into the program.
+ .
+ This package has the service, augurd, started by D-Bus when first asked,
+ and augur, a command line for asking it and checking its configuration.

@@ -33,6 +33,13 @@ is not activatable"):
 
     busctl --user call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus ReloadConfig
 
+Debian 12 and 13 and Ubuntu 24.04 (amd64 and arm64) have `.deb`s on each
+[release](https://github.com/matthewp/augur/releases). To build one
+yourself, on the system it's for, from the top of the source (it installs
+what it needs to build with apt, so as root, or in a container):
+
+    build-aux/build-deb.sh OUTDIR
+
 Then write `~/.config/augur/config` (below) and ask it something:
 
     augur status                 # on or off, and why
