@@ -149,6 +149,65 @@ expect "anthropic schema as a tool" '{"categories":["sports"]}' "$("$AUGUR" ask 
 expect "the tool is required" "answer" "$(last_request | field 'r["body"]["tool_choice"]["name"]')"
 expect "a non-object schema, wrapped and unwrapped" "42" "$("$AUGUR" ask -p claude --schema '{"type":"integer"}' number)"
 
+# ---- Tools ------------------------------------------------------------------
+# The weather tool says what it was given, and notes that it ran.
+cat > "$TMP/tools.json" <<EOF
+[
+  {"name": "weather", "description": "The weather in a city",
+   "schema": {"type": "object", "properties": {"city": {"type": "string"}},
+              "required": ["city"], "additionalProperties": false},
+   "command": "tee -a $TMP/ran"},
+  {"name": "broken", "schema": {"type": "object"},
+   "command": "echo it broke >&2; exit 3"},
+  {"name": "slowtool", "schema": {"type": "object"}, "command": "sleep 5"}
+]
+EOF
+T="--tools $TMP/tools.json"
+expect "a tool's result goes back to the model" 'The tool said: {"city":"Paris"}' "$("$AUGUR" ask $T --no-stream weather)"
+expect "the tools went to the provider" "weather" "$(last_request | field 'r["body"]["tools"][0]["function"]["name"]')"
+expect "the result answers its call" "call_0_0" "$(last_request | field 'r["body"]["messages"][-1]["tool_call_id"]')"
+expect "the call is in the history" "weather" "$(last_request | field 'r["body"]["messages"][-2]["tool_calls"][0]["function"]["name"]')"
+expect "streamed: every turn's text" 'Let me look. The tool said: {"city":"Paris"}' "$("$AUGUR" ask $T weather)"
+info=$("$AUGUR" ask -v $T --no-stream weather 2>&1 >/dev/null)
+contains "-v counts the calls" "1 tool call in 2 rounds" "$info"
+expect "two calls at once, answered in order" 'The tool said: {"city":"Paris"} | {"city":"Rome"}' "$("$AUGUR" ask $T --no-stream twice weather)"
+rm -f "$TMP/ran"
+out=$("$AUGUR" ask $T --no-stream badargs weather)
+contains "arguments that don't fit go back to the model" "Error: the arguments don't match" "$out"
+expect "... and the tool isn't run for them" "" "$(cat "$TMP/ran" 2>/dev/null)"
+expect "a tool that fails" "The tool said: Error: it broke" "$("$AUGUR" ask $T --no-stream broken)"
+out=$("$AUGUR" ask -v $T --max-rounds 3 --no-stream loop weather 2>&1)
+contains "out of rounds, it answers without tools" "No more tools" "$out"
+contains "... after max-rounds" "2 tool calls in 3 rounds" "$out"
+expect "... told not to call any" "none" "$(last_request | field 'r["body"]["tool_choice"]')"
+
+expect "anthropic tools" 'The tool said: {"city":"Paris"}' "$("$AUGUR" ask -p claude $T --no-stream weather)"
+expect "anthropic: the results go as a user message" "toolu_0_0" "$(last_request | field 'r["body"]["messages"][-1]["content"][0]["tool_use_id"]')"
+expect "anthropic: the call's input is JSON" "Paris" "$(last_request | field 'r["body"]["messages"][-2]["content"][1]["input"]["city"]')"
+expect "anthropic: a failed tool says so" "The tool said: Error: it broke" "$("$AUGUR" ask -p claude $T --no-stream broken)"
+expect "anthropic: is_error" "True" "$(last_request | field 'r["body"]["messages"][-1]["content"][0]["is_error"]')"
+expect "anthropic: tools and a schema" '{"categories":["sports"]}' "$("$AUGUR" ask -p claude $T --schema "$SCHEMA" weather)"
+expect "... any tool, the answer one included" "any" "$(head -n -1 "$TMP/requests" | tail -n 1 | field 'r["body"]["tool_choice"]["type"]')"
+
+echo '[{"name": "answer", "command": "true"}]' > "$TMP/answer.json"
+out=$("$AUGUR" ask --tools "$TMP/answer.json" hi 2>&1)
+contains "the answer tool is Augur's" "can't be called \"answer\"" "$out"
+echo '[{"name": "t", "schema": {"type": "string"}, "command": "true"}]' > "$TMP/string.json"
+out=$("$AUGUR" ask --tools "$TMP/string.json" hi 2>&1)
+contains "a tool's schema is for an object" "isn't a JSON Schema for an object" "$out"
+out=$(gdbus call --session --dest io.github.matthewp.Augur --object-path /io/github/matthewp/Augur \
+	--method io.github.matthewp.Augur1.Ask \
+	"{'app-id': <'t'>, 'messages': <[{'role': <'user'>, 'content': <'hi'>}]>, 'tools': <[{'name': <'t'>}]>}" 2>&1)
+contains "tools need Complete" "tools need Complete" "$out"
+"$AUGUR" ask $T slowtool > /dev/null 2>&1 &
+ASKER=$!
+sleep 1
+kill -INT "$ASKER"
+wait "$ASKER"
+sleep 0.5
+contains "cancelling while a tool runs" '"tools":["slowtool"],"result":"Cancelled"' "$(tail -n 1 "$LOG")"
+contains "the log names the tools" '"rounds":2,"tools":["weather"]' "$(cat "$LOG")"
+
 # ---- Errors -----------------------------------------------------------------
 out=$("$AUGUR" ask rate 2>&1); status=$?
 contains "rate limited" "RateLimited: Slow down" "$out"
@@ -179,7 +238,7 @@ contains "a program leaving cancels its requests" '"result":"Cancelled"' "$(tail
 
 # ---- The log ----------------------------------------------------------------------
 contains "the log has the app and model" '"app":"test.app","profile":"main","model":"app-model"' "$(cat "$LOG")"
-case "$(cat "$LOG")" in *"Hello"*|*"categorise"*) fail "the log has no text" ;; *) pass "the log has no text" ;; esac
+case "$(cat "$LOG")" in *"Hello"*|*"categorise"*|*"Paris"*) fail "the log has no text" ;; *) pass "the log has no text" ;; esac
 
 # ---- Turning it off -----------------------------------------------------------------
 sed -i 's/^default-profile = main/default-profile = main\nenabled = false/' "$CONFIG"

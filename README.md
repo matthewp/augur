@@ -34,6 +34,11 @@ Then write `~/.config/augur/config` (below) and ask it something:
     augur ask -p anthropic -t smart -s "Be brief." "Why is the sky blue?"
     augur ask --schema '{"type":"object","properties":{"mood":{"enum":["happy","sad"]}},"required":["mood"]}' "I lost my keys"
     echo "a prompt from stdin" | augur ask -v    # -v: the model and tokens
+    augur ask --tools tools.json "What's the weather in Paris?"
+
+A tools file is a JSON array of `{name, description, schema, command}`: a
+call's arguments go to the command on stdin, what it prints is the result,
+and if it fails, what it printed to stderr is why.
 
 ## Why a service
 
@@ -46,6 +51,9 @@ Then write `~/.config/augur/config` (below) and ask it something:
   back JSON that matches it, or an error, whatever the provider supports:
   its own structured output where it has it, else tool use, else prompting
   and checking (and asking again).
+- **Tools without the loop.** A program offers the model tools and gets
+  their calls as signals, with arguments already checked against the
+  tool's schema; Augur carries the conversation to the answer.
 - **One switch.** Programs ask whether AI is on and show or hide their AI
   features to match.
 
@@ -186,6 +194,11 @@ interface io.github.matthewp.Augur1.Request     (on each handle)
   signal Done(text: s, info: a{sv})         # the whole answer
   signal Failed(error: s, message: s)       # error: a D-Bus error name
   method Cancel()
+
+  signal ToolCall(id: s, name: s, arguments: s)  # arguments: JSON matching
+                                                 # the tool's schema
+  method ToolDone(id: s, result: s)         # what the tool gives back
+  method ToolFailed(id: s, message: s)      # the model is told it failed, and why
 ```
 
 A request (`a{sv}`):
@@ -201,10 +214,13 @@ A request (`a{sv}`):
 | `stream`   | b         | send `Delta`s (default true for `Complete`) |
 | `max-tokens` | u       | optional |
 | `temperature` | d      | optional |
+| `tools`    | aa{sv}    | tools the model may call (`Complete` only): `name` (s: letters, digits, `_` and `-`), `description` (s), `schema` (s: a JSON Schema for its arguments, an object; `{"type":"object"}` if not given) |
+| `max-rounds` | u       | turns the model gets before it must answer without tools (8) |
 
 `info` in `Done` and `Ask`: `profile` (s), `model` (s), `attempts` (i: 2
-if a structured answer was asked for again), and `input-tokens` and
-`output-tokens` (x) when the provider said.
+if a structured answer was asked for again), `rounds` (i: times the
+model was asked), `tool-calls` (i), and `input-tokens` and `output-tokens`
+(x, over every round) when the provider said.
 
 Signals for a request go to the program that made it alone (D-Bus unicast
 signals), never to the bus at large. Subscribe to them (sender
@@ -219,6 +235,36 @@ With a `schema`, `Delta`s still come (the JSON as it's written, for a
 program that wants to show progress) but only `Done`'s text is checked
 against the schema: if the answer doesn't match, Augur asks again once,
 saying what was wrong, then fails with `Error.Schema`.
+
+### Tools
+
+A program offers tools; Augur never runs anything itself. When the
+model's turn ends in calls:
+
+1. Each call's arguments are checked against its tool's schema. A call
+   that doesn't match, or names no tool, is answered by Augur, saying
+   what was wrong, and never reaches the program.
+2. The rest come as `ToolCall` signals, in order, and the request gives up
+   its place with the provider while it waits.
+3. The program answers each with `ToolDone` or `ToolFailed`, in any
+   order. There's no time limit: a tool may be waiting on the user ("send
+   this?"). `Cancel` or leaving the bus ends it.
+4. With every call answered, the request is next in its profile's queue,
+   and the model gets the results in the order it made the calls.
+
+`Delta`s carry the text of every turn ("Let me check your calendar.");
+a `ToolCall` marks where a turn ends. `Done`'s text is the last turn's:
+the answer. On the last of `max-rounds` turns the model is told to
+answer without tools, with what it has.
+
+With a `schema` too, the answer is still checked. On Anthropic, whose
+structured answers come as a tool called `answer`, that tool joins the
+program's and the model must call one of them each turn; `answer` can't
+be the name of a program's tool.
+
+Tools need a handle to call back on: `Ask` with `tools` is
+`InvalidArgs`. The log has the tools called, by name, never their
+arguments or results.
 
 Errors, each `io.github.matthewp.Augur1.Error.` and: `Disabled`,
 `NoProfile`, `NoModel`, `Auth` (the key was refused or couldn't be got),
@@ -269,9 +315,15 @@ out.)
 
 - **Images and files** in `content`: later, as parts (`a{sv}` with a
   `type`), when something needs them.
-- **Tools** (the model calling back into the program): later; not needed
-  for anything planned.
+- **Tool use in the history.** A program continuing a conversation
+  sends back text alone, so the model sees its earlier answers but not
+  the calls behind them. `Done` could give the round's messages in
+  Augur's own form, to be sent back as they are.
+- **Tools by prompting** for models without tool use of their own, as the
+  schema is for structured answers: the answer either a call or the
+  final one. For now such a provider's error is `Error.Provider`.
 - **Spending limits** per app or per day: worth having before anything runs
-  unattended for long; the log is the start of it.
+  unattended for long, more so with tools, where one request is several;
+  `max-rounds` and the log are the start of it.
 - **Model lists**: providers that list models make `ListModels` easy; for
   the rest, it's what the profile names.

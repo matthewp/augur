@@ -33,7 +33,7 @@ augurd = executable(
 augur = executable(
 	'augur',
 	'src/augur.c',
-	dependencies: [glib, gio, gio_unix],
+	dependencies: [glib, gio, gio_unix, json],
 	install: true,
 )
 

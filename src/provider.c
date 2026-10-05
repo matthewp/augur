@@ -5,6 +5,15 @@
 #define ANTHROPIC_MAX_TOKENS 4096   /* it must be given */
 #define TOOL "answer"               /* the tool a structured answer comes as */
 
+/* A tool call as it's written. */
+struct tool_call {
+	char *id, *name;
+	GString *arguments;
+};
+
+/* Anthropic: what the content block being written is. */
+enum block { BLOCK_TEXT, BLOCK_ANSWER, BLOCK_CALL, BLOCK_OTHER };
+
 struct call {
 	SoupMessage *msg;
 	GDataInputStream *lines;
@@ -13,6 +22,9 @@ struct call {
 	bool tool;            /* Anthropic: the answer is a tool's input */
 	bool wrapped;         /* ... wrapped in {"answer": ...}, the schema not
 	                       * being an object */
+	bool answered;        /* ... and it was called */
+	enum block block;
+	GPtrArray *calls;     /* struct tool_call: the tools it's calling */
 	int status;
 	GString *text;        /* the answer so far */
 	GString *body;        /* an error's body */
@@ -55,18 +67,62 @@ static void add_openai_messages(JsonBuilder *b, const struct call_spec *spec,
 	for (guint i = 0; i < n; i++) {
 		JsonObject *m = json_array_get_object_element(spec->messages, i);
 		const char *role = json_object_get_string_member(m, "role");
-		const char *content = json_object_get_string_member(m, "content");
+		const char *content = json_object_get_string_member_with_default(m,
+			"content", "");
+		JsonArray *calls = json_object_has_member(m, "calls") ?
+			json_object_get_array_member(m, "calls") : NULL;
 		json_builder_begin_object(b);
 		json_builder_set_member_name(b, "role");
 		json_builder_add_string_value(b, role);
+		if (strcmp(role, "tool") == 0) {
+			/* No word for a failure but its text. */
+			json_builder_set_member_name(b, "tool_call_id");
+			json_builder_add_string_value(b, json_object_get_string_member(m, "id"));
+			json_builder_set_member_name(b, "content");
+			if (json_object_get_boolean_member_with_default(m, "error", FALSE)) {
+				char *e = g_strconcat("Error: ", content, NULL);
+				json_builder_add_string_value(b, e);
+				g_free(e);
+			} else {
+				json_builder_add_string_value(b, content);
+			}
+			json_builder_end_object(b);
+			continue;
+		}
 		json_builder_set_member_name(b, "content");
 		if (schema != NULL && !system_seen && strcmp(role, "system") == 0) {
 			char *with = g_strconcat(content, "\n\n", schema_prompt, schema, NULL);
 			json_builder_add_string_value(b, with);
 			g_free(with);
 			system_seen = true;
+		} else if (calls != NULL && content[0] == '\0') {
+			json_builder_add_null_value(b);
 		} else {
 			json_builder_add_string_value(b, content);
+		}
+		if (calls != NULL) {
+			json_builder_set_member_name(b, "tool_calls");
+			json_builder_begin_array(b);
+			for (guint j = 0; j < json_array_get_length(calls); j++) {
+				JsonObject *call = json_array_get_object_element(calls, j);
+				json_builder_begin_object(b);
+				json_builder_set_member_name(b, "id");
+				json_builder_add_string_value(b,
+					json_object_get_string_member(call, "id"));
+				json_builder_set_member_name(b, "type");
+				json_builder_add_string_value(b, "function");
+				json_builder_set_member_name(b, "function");
+				json_builder_begin_object(b);
+				json_builder_set_member_name(b, "name");
+				json_builder_add_string_value(b,
+					json_object_get_string_member(call, "name"));
+				json_builder_set_member_name(b, "arguments");
+				json_builder_add_string_value(b,
+					json_object_get_string_member(call, "arguments"));
+				json_builder_end_object(b);
+				json_builder_end_object(b);
+			}
+			json_builder_end_array(b);
 		}
 		json_builder_end_object(b);
 	}
@@ -134,6 +190,36 @@ static JsonNode *openai_body(const struct call_spec *spec) {
 		json_builder_end_object(b);
 		json_builder_end_object(b);
 	}
+	if (spec->tools != NULL && json_array_get_length(spec->tools) > 0) {
+		json_builder_set_member_name(b, "tools");
+		json_builder_begin_array(b);
+		for (guint i = 0; i < json_array_get_length(spec->tools); i++) {
+			JsonObject *t = json_array_get_object_element(spec->tools, i);
+			const char *description = json_object_get_string_member_with_default(t,
+				"description", "");
+			json_builder_begin_object(b);
+			json_builder_set_member_name(b, "type");
+			json_builder_add_string_value(b, "function");
+			json_builder_set_member_name(b, "function");
+			json_builder_begin_object(b);
+			json_builder_set_member_name(b, "name");
+			json_builder_add_string_value(b, json_object_get_string_member(t, "name"));
+			if (description[0] != '\0') {
+				json_builder_set_member_name(b, "description");
+				json_builder_add_string_value(b, description);
+			}
+			json_builder_set_member_name(b, "parameters");
+			json_builder_add_value(b, json_node_copy(
+				json_object_get_member(t, "schema")));
+			json_builder_end_object(b);
+			json_builder_end_object(b);
+		}
+		json_builder_end_array(b);
+		if (spec->tools_off) {
+			json_builder_set_member_name(b, "tool_choice");
+			json_builder_add_string_value(b, "none");
+		}
+	}
 	json_builder_end_object(b);
 	JsonNode *root = json_builder_get_root(b);
 	g_object_unref(b);
@@ -152,14 +238,80 @@ static bool schema_is_object(JsonNode *schema) {
 		"object") == 0;
 }
 
+/* JSON text as a node, or NULL. */
+static JsonNode *parse_json(const char *text) {
+	JsonParser *parser = json_parser_new();
+	JsonNode *node = NULL;
+	if (text != NULL && json_parser_load_from_data(parser, text, -1, NULL) &&
+			json_parser_get_root(parser) != NULL) {
+		node = json_node_copy(json_parser_get_root(parser));
+	}
+	g_object_unref(parser);
+	return node;
+}
+
+static void add_anthropic_tool(JsonBuilder *b, const char *name,
+		const char *description, JsonNode *schema) {
+	json_builder_begin_object(b);
+	json_builder_set_member_name(b, "name");
+	json_builder_add_string_value(b, name);
+	if (description != NULL && description[0] != '\0') {
+		json_builder_set_member_name(b, "description");
+		json_builder_add_string_value(b, description);
+	}
+	json_builder_set_member_name(b, "input_schema");
+	json_builder_add_value(b, json_node_copy(schema));
+	json_builder_end_object(b);
+}
+
+/* An assistant message that called tools: its text, then the calls. */
+static void add_anthropic_calls(JsonBuilder *b, const char *content,
+		JsonArray *calls) {
+	json_builder_begin_array(b);
+	if (content[0] != '\0') {
+		json_builder_begin_object(b);
+		json_builder_set_member_name(b, "type");
+		json_builder_add_string_value(b, "text");
+		json_builder_set_member_name(b, "text");
+		json_builder_add_string_value(b, content);
+		json_builder_end_object(b);
+	}
+	for (guint j = 0; j < json_array_get_length(calls); j++) {
+		JsonObject *call = json_array_get_object_element(calls, j);
+		JsonNode *input = parse_json(json_object_get_string_member(call,
+			"arguments"));
+		if (input == NULL || !JSON_NODE_HOLDS_OBJECT(input)) {
+			if (input != NULL) {
+				json_node_unref(input);
+			}
+			input = json_node_init_object(json_node_alloc(), json_object_new());
+		}
+		json_builder_begin_object(b);
+		json_builder_set_member_name(b, "type");
+		json_builder_add_string_value(b, "tool_use");
+		json_builder_set_member_name(b, "id");
+		json_builder_add_string_value(b, json_object_get_string_member(call, "id"));
+		json_builder_set_member_name(b, "name");
+		json_builder_add_string_value(b, json_object_get_string_member(call,
+			"name"));
+		json_builder_set_member_name(b, "input");
+		json_builder_add_value(b, input);
+		json_builder_end_object(b);
+	}
+	json_builder_end_array(b);
+}
+
 /* Anthropic: system messages go apart, and a structured answer comes as
  * the input of a tool it must use, whose input must be an object: any
- * other schema is wrapped as {"answer": ...}. */
+ * other schema is wrapped as {"answer": ...}. With a program's tools too,
+ * it must use one of them or that one. The answers to a turn's calls go
+ * together in one user message. */
 static JsonNode *anthropic_body(const struct call_spec *spec, bool *tool,
 		bool *wrapped) {
 	const struct profile *p = spec->profile;
 	*tool = spec->schema != NULL && p->structured == STRUCTURED_NATIVE;
 	*wrapped = *tool && !schema_is_object(spec->schema);
+	bool tools = spec->tools != NULL && json_array_get_length(spec->tools) > 0;
 	char *schema_text = spec->schema != NULL && !*tool ?
 		json_to_string(spec->schema, FALSE) : NULL;
 
@@ -173,10 +325,12 @@ static JsonNode *anthropic_body(const struct call_spec *spec, bool *tool,
 	GString *system = g_string_new(NULL);
 	json_builder_set_member_name(b, "messages");
 	json_builder_begin_array(b);
-	for (guint i = 0; i < json_array_get_length(spec->messages); i++) {
+	guint n = json_array_get_length(spec->messages);
+	for (guint i = 0; i < n; i++) {
 		JsonObject *m = json_array_get_object_element(spec->messages, i);
 		const char *role = json_object_get_string_member(m, "role");
-		const char *content = json_object_get_string_member(m, "content");
+		const char *content = json_object_get_string_member_with_default(m,
+			"content", "");
 		if (strcmp(role, "system") == 0) {
 			g_string_append_printf(system, "%s%s", system->len ? "\n\n" : "",
 				content);
@@ -184,9 +338,41 @@ static JsonNode *anthropic_body(const struct call_spec *spec, bool *tool,
 		}
 		json_builder_begin_object(b);
 		json_builder_set_member_name(b, "role");
-		json_builder_add_string_value(b, role);
-		json_builder_set_member_name(b, "content");
-		json_builder_add_string_value(b, content);
+		if (strcmp(role, "tool") == 0) {
+			json_builder_add_string_value(b, "user");
+			json_builder_set_member_name(b, "content");
+			json_builder_begin_array(b);
+			for (; i < n; i++) {
+				JsonObject *t = json_array_get_object_element(spec->messages, i);
+				if (g_strcmp0(json_object_get_string_member(t, "role"), "tool") != 0) {
+					break;
+				}
+				json_builder_begin_object(b);
+				json_builder_set_member_name(b, "type");
+				json_builder_add_string_value(b, "tool_result");
+				json_builder_set_member_name(b, "tool_use_id");
+				json_builder_add_string_value(b, json_object_get_string_member(t, "id"));
+				json_builder_set_member_name(b, "content");
+				json_builder_add_string_value(b,
+					json_object_get_string_member_with_default(t, "content", ""));
+				if (json_object_get_boolean_member_with_default(t, "error", FALSE)) {
+					json_builder_set_member_name(b, "is_error");
+					json_builder_add_boolean_value(b, TRUE);
+				}
+				json_builder_end_object(b);
+			}
+			i--;
+			json_builder_end_array(b);
+		} else {
+			json_builder_add_string_value(b, role);
+			json_builder_set_member_name(b, "content");
+			if (json_object_has_member(m, "calls")) {
+				add_anthropic_calls(b, content,
+					json_object_get_array_member(m, "calls"));
+			} else {
+				json_builder_add_string_value(b, content);
+			}
+		}
 		json_builder_end_object(b);
 	}
 	json_builder_end_array(b);
@@ -201,41 +387,46 @@ static JsonNode *anthropic_body(const struct call_spec *spec, bool *tool,
 	g_string_free(system, TRUE);
 	g_free(schema_text);
 
-	if (*tool) {
+	if (*tool || tools) {
 		json_builder_set_member_name(b, "tools");
 		json_builder_begin_array(b);
-		json_builder_begin_object(b);
-		json_builder_set_member_name(b, "name");
-		json_builder_add_string_value(b, TOOL);
-		json_builder_set_member_name(b, "description");
-		json_builder_add_string_value(b, "Give your answer.");
-		json_builder_set_member_name(b, "input_schema");
-		if (*wrapped) {
+		for (guint i = 0; tools && i < json_array_get_length(spec->tools); i++) {
+			JsonObject *t = json_array_get_object_element(spec->tools, i);
+			add_anthropic_tool(b, json_object_get_string_member(t, "name"),
+				json_object_get_string_member_with_default(t, "description", ""),
+				json_object_get_member(t, "schema"));
+		}
+		if (*tool && *wrapped) {
+			JsonObject *props = json_object_new();
+			json_object_set_member(props, TOOL, json_node_copy(spec->schema));
+			JsonArray *required = json_array_new();
+			json_array_add_string_element(required, TOOL);
+			JsonObject *o = json_object_new();
+			json_object_set_string_member(o, "type", "object");
+			json_object_set_object_member(o, "properties", props);
+			json_object_set_array_member(o, "required", required);
+			JsonNode *schema = json_node_init_object(json_node_alloc(), o);
+			add_anthropic_tool(b, TOOL, "Give your answer.", schema);
+			json_node_unref(schema);
+			json_object_unref(o);
+		} else if (*tool) {
+			add_anthropic_tool(b, TOOL, "Give your answer.", spec->schema);
+		}
+		json_builder_end_array(b);
+		/* Left out, it may call a tool or answer. */
+		const char *choice = *tool && (!tools || spec->tools_off) ? "tool" :
+			*tool ? "any" : spec->tools_off ? "none" : NULL;
+		if (choice != NULL) {
+			json_builder_set_member_name(b, "tool_choice");
 			json_builder_begin_object(b);
 			json_builder_set_member_name(b, "type");
-			json_builder_add_string_value(b, "object");
-			json_builder_set_member_name(b, "properties");
-			json_builder_begin_object(b);
-			json_builder_set_member_name(b, TOOL);
-			json_builder_add_value(b, json_node_copy(spec->schema));
+			json_builder_add_string_value(b, choice);
+			if (strcmp(choice, "tool") == 0) {
+				json_builder_set_member_name(b, "name");
+				json_builder_add_string_value(b, TOOL);
+			}
 			json_builder_end_object(b);
-			json_builder_set_member_name(b, "required");
-			json_builder_begin_array(b);
-			json_builder_add_string_value(b, TOOL);
-			json_builder_end_array(b);
-			json_builder_end_object(b);
-		} else {
-			json_builder_add_value(b, json_node_copy(spec->schema));
 		}
-		json_builder_end_object(b);
-		json_builder_end_array(b);
-		json_builder_set_member_name(b, "tool_choice");
-		json_builder_begin_object(b);
-		json_builder_set_member_name(b, "type");
-		json_builder_add_string_value(b, "tool");
-		json_builder_set_member_name(b, "name");
-		json_builder_add_string_value(b, TOOL);
-		json_builder_end_object(b);
 	}
 	json_builder_end_object(b);
 	JsonNode *root = json_builder_get_root(b);
@@ -269,13 +460,50 @@ static void set_headers(SoupMessage *msg, const struct call_spec *spec) {
 
 /* ---- The answer ----------------------------------------------------------- */
 
+static void tool_call_free(gpointer data) {
+	struct tool_call *t = data;
+	g_free(t->id);
+	g_free(t->name);
+	g_string_free(t->arguments, TRUE);
+	g_free(t);
+}
+
+static struct tool_call *add_call(struct call *c, const char *id,
+		const char *name) {
+	struct tool_call *t = g_new0(struct tool_call, 1);
+	t->id = g_strdup(id != NULL ? id : "");
+	t->name = g_strdup(name != NULL ? name : "");
+	t->arguments = g_string_new(NULL);
+	g_ptr_array_add(c->calls, t);
+	return t;
+}
+
+/* The calls as call_result has them; an id is "" if none was given. */
+static JsonArray *calls_of(struct call *c) {
+	JsonArray *a = json_array_new();
+	for (guint i = 0; i < c->calls->len; i++) {
+		struct tool_call *t = c->calls->pdata[i];
+		JsonObject *o = json_object_new();
+		json_object_set_string_member(o, "id", t->id);
+		json_object_set_string_member(o, "name", t->name);
+		json_object_set_string_member(o, "arguments",
+			t->arguments->len > 0 ? t->arguments->str : "{}");
+		json_array_add_object_element(a, o);
+	}
+	return a;
+}
+
 static void finish(struct call *c, enum call_error error, char *message) {
-	struct call_result r = { error, message, NULL, c->input_tokens,
+	struct call_result r = { error, message, NULL, NULL, c->input_tokens,
 		c->output_tokens };
 	if (error == CALL_OK) {
 		r.text = g_string_free(c->text, FALSE);
 		c->text = NULL;
-		if (c->wrapped) {
+		/* Answering wins over any calls made with it. */
+		if (c->calls->len > 0 && !c->answered) {
+			r.calls = calls_of(c);
+		}
+		if (c->wrapped && c->answered) {
 			/* {"answer": X} -> X */
 			JsonParser *parser = json_parser_new();
 			if (json_parser_load_from_data(parser, r.text, -1, NULL) &&
@@ -292,6 +520,10 @@ static void finish(struct call *c, enum call_error error, char *message) {
 	}
 	c->done(&r, c->data);
 	g_free(r.text);
+	if (r.calls != NULL) {
+		json_array_unref(r.calls);
+	}
+	g_ptr_array_unref(c->calls);
 	g_free(message);
 	if (c->text != NULL) {
 		g_string_free(c->text, TRUE);
@@ -356,6 +588,48 @@ static void add_text(struct call *c, const char *text) {
 	}
 }
 
+/* Calls come in pieces, each saying which call (index) it's part of: the
+ * first with the id and name, then the arguments a bit at a time. */
+static void openai_calls(struct call *c, JsonArray *calls) {
+	for (guint i = 0; i < json_array_get_length(calls); i++) {
+		JsonNode *n = json_array_get_element(calls, i);
+		if (!JSON_NODE_HOLDS_OBJECT(n)) {
+			continue;
+		}
+		JsonObject *piece = json_node_get_object(n);
+		gint64 index = json_object_get_int_member_with_default(piece, "index", i);
+		if (index < 0 || index > 128) {
+			continue;
+		}
+		while (c->calls->len <= index) {
+			add_call(c, NULL, NULL);
+		}
+		struct tool_call *t = c->calls->pdata[index];
+		const char *id = json_object_get_string_member_with_default(piece, "id",
+			NULL);
+		if (id != NULL && id[0] != '\0') {
+			g_free(t->id);
+			t->id = g_strdup(id);
+		}
+		JsonNode *fn = json_object_get_member(piece, "function");
+		if (fn == NULL || !JSON_NODE_HOLDS_OBJECT(fn)) {
+			continue;
+		}
+		JsonObject *f = json_node_get_object(fn);
+		const char *name = json_object_get_string_member_with_default(f, "name",
+			NULL);
+		if (name != NULL && name[0] != '\0') {
+			g_free(t->name);
+			t->name = g_strdup(name);
+		}
+		const char *args = json_object_get_string_member_with_default(f,
+			"arguments", NULL);
+		if (args != NULL) {
+			g_string_append(t->arguments, args);
+		}
+	}
+}
+
 static void openai_event(struct call *c, JsonObject *o) {
 	JsonNode *e = json_object_get_member(o, "error");
 	if (e != NULL && c->stream_error == NULL) {
@@ -376,10 +650,14 @@ static void openai_event(struct call *c, JsonObject *o) {
 			json_node_get_array(choices), 0);
 		JsonNode *delta = json_object_get_member(choice, "delta");
 		if (delta != NULL && JSON_NODE_HOLDS_OBJECT(delta)) {
-			JsonNode *content = json_object_get_member(
-				json_node_get_object(delta), "content");
+			JsonObject *d = json_node_get_object(delta);
+			JsonNode *content = json_object_get_member(d, "content");
 			if (content != NULL && JSON_NODE_HOLDS_VALUE(content)) {
 				add_text(c, json_node_get_string(content));
+			}
+			JsonNode *calls = json_object_get_member(d, "tool_calls");
+			if (calls != NULL && JSON_NODE_HOLDS_ARRAY(calls)) {
+				openai_calls(c, json_node_get_array(calls));
 			}
 		}
 	}
@@ -403,14 +681,39 @@ static void anthropic_event(struct call *c, JsonObject *o) {
 			c->input_tokens = json_object_get_int_member_with_default(u,
 				"input_tokens", -1);
 		}
+	} else if (strcmp(type, "content_block_start") == 0) {
+		JsonObject *cb = json_object_has_member(o, "content_block") ?
+			json_object_get_object_member(o, "content_block") : NULL;
+		const char *bt = cb != NULL ?
+			json_object_get_string_member_with_default(cb, "type", "") : "";
+		const char *name = cb != NULL ?
+			json_object_get_string_member_with_default(cb, "name", "") : "";
+		if (strcmp(bt, "text") == 0) {
+			c->block = BLOCK_TEXT;
+		} else if (strcmp(bt, "tool_use") == 0 && c->tool &&
+				strcmp(name, TOOL) == 0) {
+			c->block = BLOCK_ANSWER;
+			c->answered = true;
+		} else if (strcmp(bt, "tool_use") == 0) {
+			c->block = BLOCK_CALL;
+			add_call(c, json_object_get_string_member_with_default(cb, "id", NULL),
+				name);
+		} else {
+			c->block = BLOCK_OTHER;   /* thinking, say */
+		}
 	} else if (strcmp(type, "content_block_delta") == 0) {
 		JsonObject *d = json_object_get_object_member(o, "delta");
 		const char *dt = d != NULL ?
 			json_object_get_string_member_with_default(d, "type", "") : "";
-		if (strcmp(dt, "text_delta") == 0 && !c->tool) {
+		const char *partial = strcmp(dt, "input_json_delta") == 0 ?
+			json_object_get_string_member_with_default(d, "partial_json", "") : NULL;
+		if (strcmp(dt, "text_delta") == 0 && c->block == BLOCK_TEXT && !c->tool) {
 			add_text(c, json_object_get_string_member(d, "text"));
-		} else if (strcmp(dt, "input_json_delta") == 0 && c->tool) {
-			add_text(c, json_object_get_string_member(d, "partial_json"));
+		} else if (partial != NULL && c->block == BLOCK_ANSWER) {
+			add_text(c, partial);
+		} else if (partial != NULL && c->block == BLOCK_CALL) {
+			struct tool_call *t = c->calls->pdata[c->calls->len - 1];
+			g_string_append(t->arguments, partial);
 		}
 	} else if (strcmp(type, "message_delta") == 0) {
 		JsonObject *u = json_object_has_member(o, "usage") ?
@@ -517,6 +820,7 @@ void call_start(SoupSession *session, const struct call_spec *spec,
 	struct call *c = g_new0(struct call, 1);
 	c->kind = spec->profile->kind;
 	c->text = g_string_new(NULL);
+	c->calls = g_ptr_array_new_with_free_func(tool_call_free);
 	c->input_tokens = c->output_tokens = -1;
 	c->delta = delta;
 	c->done = done;

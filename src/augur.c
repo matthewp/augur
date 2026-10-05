@@ -7,9 +7,15 @@
  *   augur models [PROFILE]          the models a provider lists
  *   augur ask [OPTIONS] [PROMPT]    an answer, as it's written (the prompt
  *                                   from stdin if not given)
+ *
+ * With --tools FILE, ask offers the model tools, each a shell command: a
+ * JSON array of {name, description, schema, command}. A call's arguments
+ * (JSON) go to the command on stdin; what it prints is the result, and if
+ * it fails, what it printed to stderr is why.
  */
 #include <gio/gio.h>
 #include <glib-unix.h>
+#include <json-glib/json-glib.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -130,6 +136,7 @@ static struct {
 	char *handle;
 	bool streamed;
 	bool verbose;
+	GHashTable *commands;   /* tool name -> its command */
 	int status;
 } ask;
 
@@ -145,8 +152,133 @@ static void print_info(GVariant *info) {
 	g_variant_lookup(info, "input-tokens", "x", &in);
 	g_variant_lookup(info, "output-tokens", "x", &out);
 	g_variant_lookup(info, "attempts", "i", &attempts);
+	gint32 rounds = 1, calls = 0;
+	g_variant_lookup(info, "rounds", "i", &rounds);
+	g_variant_lookup(info, "tool-calls", "i", &calls);
+	char *tools = calls > 0 ? g_strdup_printf(", %d tool call%s in %d rounds",
+		calls, calls == 1 ? "" : "s", rounds) : g_strdup("");
 	g_printerr("[%s, %s: %" G_GINT64_FORMAT " in, %" G_GINT64_FORMAT
-		" out%s]\n", profile, model, in, out, attempts > 1 ? ", asked twice" : "");
+		" out%s%s]\n", profile, model, in, out, attempts > 1 ? ", asked twice" : "",
+		tools);
+	g_free(tools);
+}
+
+/* ---- ask: tools ------------------------------------------------------------ */
+
+struct tool_run {
+	char *id;
+};
+
+static void tool_ran(GObject *src, GAsyncResult *res, gpointer data) {
+	struct tool_run *run = data;
+	char *out = NULL, *err = NULL;
+	GError *error = NULL;
+	bool ok = g_subprocess_communicate_utf8_finish(G_SUBPROCESS(src), res, &out,
+		&err, &error);
+	const char *method = "ToolDone";
+	char *content;
+	if (!ok) {
+		method = "ToolFailed";
+		content = g_strdup(error->message);
+	} else if (!g_subprocess_get_successful(G_SUBPROCESS(src))) {
+		method = "ToolFailed";
+		content = err != NULL && g_strstrip(err)[0] != '\0' ? g_strdup(err) :
+			g_strdup_printf("it exited with %d",
+				g_subprocess_get_exit_status(G_SUBPROCESS(src)));
+	} else {
+		content = g_strdup(out != NULL ? g_strchomp(out) : "");
+	}
+	if (ask.handle != NULL) {
+		g_dbus_connection_call(bus, BUS_NAME, ask.handle, REQUEST_IFACE, method,
+			g_variant_new("(ss)", run->id, content), NULL, G_DBUS_CALL_FLAGS_NONE,
+			-1, NULL, NULL, NULL);
+	}
+	g_clear_error(&error);
+	g_free(content);
+	g_free(out);
+	g_free(err);
+	g_free(run->id);
+	g_free(run);
+}
+
+static void tool_call(const char *id, const char *name, const char *arguments) {
+	if (ask.verbose) {
+		g_printerr("[%s %s]\n", name, arguments);
+	}
+	const char *command = g_hash_table_lookup(ask.commands, name);
+	GError *error = NULL;
+	const char *argv[] = { "/bin/sh", "-c", command, NULL };
+	GSubprocess *p = command == NULL ? NULL : g_subprocess_newv(argv,
+		G_SUBPROCESS_FLAGS_STDIN_PIPE | G_SUBPROCESS_FLAGS_STDOUT_PIPE |
+		G_SUBPROCESS_FLAGS_STDERR_PIPE, &error);
+	if (p == NULL) {
+		g_dbus_connection_call(bus, BUS_NAME, ask.handle, REQUEST_IFACE,
+			"ToolFailed", g_variant_new("(ss)", id, error != NULL ? error->message :
+				"no such tool"), NULL, G_DBUS_CALL_FLAGS_NONE, -1, NULL, NULL, NULL);
+		g_clear_error(&error);
+		return;
+	}
+	struct tool_run *run = g_new0(struct tool_run, 1);
+	run->id = g_strdup(id);
+	g_subprocess_communicate_utf8_async(p, arguments, NULL, tool_ran, run);
+	g_object_unref(p);
+}
+
+/* The tools file as the request's tools, their commands kept. */
+static GVariant *load_tools(const char *path) {
+	GError *error = NULL;
+	JsonParser *parser = json_parser_new();
+	if (!json_parser_load_from_file(parser, path, &error)) {
+		g_printerr("augur: %s\n", error->message);
+		g_error_free(error);
+		g_object_unref(parser);
+		return NULL;
+	}
+	JsonNode *root = json_parser_get_root(parser);
+	if (root == NULL || !JSON_NODE_HOLDS_ARRAY(root)) {
+		g_printerr("augur: %s isn't a JSON array of tools\n", path);
+		g_object_unref(parser);
+		return NULL;
+	}
+	JsonArray *a = json_node_get_array(root);
+	GVariantBuilder b;
+	g_variant_builder_init(&b, G_VARIANT_TYPE("aa{sv}"));
+	for (guint i = 0; i < json_array_get_length(a); i++) {
+		JsonNode *n = json_array_get_element(a, i);
+		JsonObject *t = JSON_NODE_HOLDS_OBJECT(n) ? json_node_get_object(n) : NULL;
+		const char *name = t != NULL ?
+			json_object_get_string_member_with_default(t, "name", NULL) : NULL;
+		const char *command = t != NULL ?
+			json_object_get_string_member_with_default(t, "command", NULL) : NULL;
+		if (name == NULL || command == NULL) {
+			g_printerr("augur: %s: each tool needs a name and a command\n", path);
+			g_variant_builder_clear(&b);
+			g_object_unref(parser);
+			return NULL;
+		}
+		g_hash_table_insert(ask.commands, g_strdup(name), g_strdup(command));
+		GVariantBuilder tool;
+		g_variant_builder_init(&tool, G_VARIANT_TYPE("a{sv}"));
+		g_variant_builder_add(&tool, "{sv}", "name", g_variant_new_string(name));
+		const char *description = json_object_get_string_member_with_default(t,
+			"description", NULL);
+		if (description != NULL) {
+			g_variant_builder_add(&tool, "{sv}", "description",
+				g_variant_new_string(description));
+		}
+		/* The schema as JSON, or a string of it. */
+		JsonNode *schema = json_object_get_member(t, "schema");
+		if (schema != NULL) {
+			char *text = JSON_NODE_HOLDS_VALUE(schema) ?
+				g_strdup(json_node_get_string(schema)) : json_to_string(schema, FALSE);
+			g_variant_builder_add(&tool, "{sv}", "schema",
+				g_variant_new_string(text != NULL ? text : ""));
+			g_free(text);
+		}
+		g_variant_builder_add_value(&b, g_variant_builder_end(&tool));
+	}
+	g_object_unref(parser);
+	return g_variant_builder_end(&b);
 }
 
 static void on_signal(GDBusConnection *c, const char *sender, const char *path,
@@ -172,6 +304,10 @@ static void on_signal(GDBusConnection *c, const char *sender, const char *path,
 		print_info(info);
 		g_variant_unref(info);
 		g_main_loop_quit(ask.loop);
+	} else if (strcmp(signal, "ToolCall") == 0) {
+		const char *id, *name, *arguments;
+		g_variant_get(params, "(&s&s&s)", &id, &name, &arguments);
+		tool_call(id, name, arguments);
 	} else if (strcmp(signal, "Failed") == 0) {
 		const char *name, *message;
 		g_variant_get(params, "(&s&s)", &name, &message);
@@ -216,7 +352,8 @@ static void add_message(GVariantBuilder *b, const char *role,
 
 static int cmd_ask(int argc, char *argv[]) {
 	char *profile = NULL, *model = NULL, *tier = NULL, *system = NULL;
-	char *schema = NULL, *app_id = NULL;
+	char *schema = NULL, *app_id = NULL, *tools = NULL;
+	int max_rounds = 0;
 	gboolean no_stream = FALSE, verbose = FALSE;
 	GOptionEntry entries[] = {
 		{ "profile", 'p', 0, G_OPTION_ARG_STRING, &profile, "Profile", "NAME" },
@@ -226,6 +363,11 @@ static int cmd_ask(int argc, char *argv[]) {
 			"TEXT" },
 		{ "schema", 0, 0, G_OPTION_ARG_STRING, &schema,
 			"Answer in JSON matching this JSON Schema (or @FILE)", "SCHEMA" },
+		{ "tools", 0, 0, G_OPTION_ARG_FILENAME, &tools,
+			"Offer the model tools, each a command, from a JSON file: "
+			"[{name, description, schema, command}]", "FILE" },
+		{ "max-rounds", 0, 0, G_OPTION_ARG_INT, &max_rounds,
+			"Turns with tools before it must answer", "N" },
 		{ "no-stream", 0, 0, G_OPTION_ARG_NONE, &no_stream,
 			"Print the answer when it's all there", NULL },
 		{ "app-id", 0, 0, G_OPTION_ARG_STRING, &app_id,
@@ -257,6 +399,12 @@ static int cmd_ask(int argc, char *argv[]) {
 		schema = text;
 	}
 
+	ask.commands = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+	GVariant *tool_list = NULL;
+	if (tools != NULL && (tool_list = load_tools(tools)) == NULL) {
+		return 2;
+	}
+
 	GVariantBuilder messages;
 	g_variant_builder_init(&messages, G_VARIANT_TYPE("aa{sv}"));
 	if (system != NULL) {
@@ -280,6 +428,13 @@ static int cmd_ask(int argc, char *argv[]) {
 	}
 	if (schema != NULL) {
 		g_variant_builder_add(&req, "{sv}", "schema", g_variant_new_string(schema));
+	}
+	if (tool_list != NULL) {
+		g_variant_builder_add(&req, "{sv}", "tools", tool_list);
+	}
+	if (max_rounds > 0) {
+		g_variant_builder_add(&req, "{sv}", "max-rounds",
+			g_variant_new_uint32(max_rounds));
 	}
 	/* A structured answer's JSON as it's written isn't worth watching. */
 	g_variant_builder_add(&req, "{sv}", "stream",
@@ -309,7 +464,8 @@ static void usage(FILE *to) {
 		"       augur profiles\n"
 		"       augur models [PROFILE]\n"
 		"       augur ask [-p PROFILE] [-m MODEL] [-t TIER] [-s SYSTEM]\n"
-		"                 [--schema JSON|@FILE] [--no-stream] [-v] [PROMPT...]\n"
+		"                 [--schema JSON|@FILE] [--tools FILE] [--max-rounds N]\n"
+		"                 [--no-stream] [-v] [PROMPT...]\n"
 		"\n"
 		"Asks Augur's service (augurd) over D-Bus. The prompt is read from\n"
 		"stdin when it isn't given.\n", to);

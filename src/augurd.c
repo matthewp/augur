@@ -9,6 +9,12 @@
  * as Delta signals and then Done, to the program that asked alone. An
  * answer with a schema is checked (schema.c) and asked for once more if it
  * doesn't match.
+ *
+ * A request can bring tools. When the model calls them, the calls go to
+ * the program as ToolCall signals, the request gives up its place with
+ * the provider, and it waits for the program's ToolDone or ToolFailed for
+ * each; then it's next in its profile's queue, and the model is asked
+ * again with what the tools said.
  */
 #include <gio/gio.h>
 #include <glib-unix.h>
@@ -26,6 +32,8 @@
 #define REQUEST_IFACE IFACE ".Request"
 #define ERROR_PREFIX IFACE ".Error."
 #define IDLE_TIMEOUT 60     /* seconds with nothing to do, then exit */
+#define MAX_ROUNDS 8        /* turns with tools, unless the request says */
+#define RESERVED_TOOL "answer" /* provider.c's, for structured answers */
 
 static const char introspection[] =
 	"<node>"
@@ -59,7 +67,19 @@ static const char introspection[] =
 	"  <signal name='Failed'>"
 	"   <arg name='error' type='s'/><arg name='message' type='s'/>"
 	"  </signal>"
+	"  <signal name='ToolCall'>"
+	"   <arg name='id' type='s'/><arg name='name' type='s'/>"
+	"   <arg name='arguments' type='s'/>"
+	"  </signal>"
 	"  <method name='Cancel'/>"
+	"  <method name='ToolDone'>"
+	"   <arg name='id' type='s' direction='in'/>"
+	"   <arg name='result' type='s' direction='in'/>"
+	"  </method>"
+	"  <method name='ToolFailed'>"
+	"   <arg name='id' type='s' direction='in'/>"
+	"   <arg name='message' type='s' direction='in'/>"
+	"  </method>"
 	" </interface>"
 	"</node>";
 
@@ -105,6 +125,13 @@ struct request {
 	char *model;
 	JsonArray *messages;
 	JsonNode *schema;
+	JsonArray *tools;     /* objects: name, description, schema; or NULL */
+	JsonArray *turn;      /* the calls of the turn being answered */
+	GHashTable *waiting;  /* their ids still to be answered by the program */
+	GHashTable *results;  /* id -> its tool message */
+	GPtrArray *called;    /* the names of the tools called, for the log */
+	int rounds, max_rounds;
+	guint next_call;      /* for calls the provider gave no id */
 	gint64 max_tokens;
 	double temperature;
 	bool stream;
@@ -146,6 +173,7 @@ static struct {
 } srv;
 
 static void pump(const char *profile);
+static gboolean start_soon(gpointer data);
 
 /* ---- Staying, and going ---------------------------------------------------- */
 
@@ -246,6 +274,17 @@ static void log_request(struct request *r, const char *result) {
 	json_builder_add_int_value(b, r->output_tokens);
 	json_builder_set_member_name(b, "attempts");
 	json_builder_add_int_value(b, r->attempts);
+	if (r->tools != NULL) {
+		/* Which tools, never what they were given or said. */
+		json_builder_set_member_name(b, "rounds");
+		json_builder_add_int_value(b, r->rounds);
+		json_builder_set_member_name(b, "tools");
+		json_builder_begin_array(b);
+		for (guint i = 0; i < r->called->len; i++) {
+			json_builder_add_string_value(b, r->called->pdata[i]);
+		}
+		json_builder_end_array(b);
+	}
 	json_builder_set_member_name(b, "result");
 	json_builder_add_string_value(b, result);
 	json_builder_end_object(b);
@@ -291,6 +330,15 @@ static void request_free(struct request *r) {
 	if (r->schema != NULL) {
 		json_node_unref(r->schema);
 	}
+	if (r->tools != NULL) {
+		json_array_unref(r->tools);
+	}
+	if (r->turn != NULL) {
+		json_array_unref(r->turn);
+	}
+	g_hash_table_unref(r->waiting);
+	g_hash_table_unref(r->results);
+	g_ptr_array_unref(r->called);
 	g_clear_object(&r->cancel);
 	config_unref(r->config);
 	g_free(r);
@@ -328,6 +376,9 @@ static GVariant *info_of(struct request *r) {
 	}
 	g_variant_builder_add(&b, "{sv}", "attempts",
 		g_variant_new_int32(r->attempts));
+	g_variant_builder_add(&b, "{sv}", "rounds", g_variant_new_int32(r->rounds));
+	g_variant_builder_add(&b, "{sv}", "tool-calls",
+		g_variant_new_int32(r->called->len));
 	return g_variant_builder_end(&b);
 }
 
@@ -391,6 +442,132 @@ static void add_message(struct request *r, const char *role,
 	json_array_add_object_element(r->messages, m);
 }
 
+/* ---- Requests: tools ---------------------------------------------------------- */
+
+static JsonObject *tool_of(struct request *r, const char *name) {
+	for (guint i = 0; i < json_array_get_length(r->tools); i++) {
+		JsonObject *t = json_array_get_object_element(r->tools, i);
+		if (g_strcmp0(json_object_get_string_member(t, "name"), name) == 0) {
+			return t;
+		}
+	}
+	return NULL;
+}
+
+static void tool_result(struct request *r, const char *id, const char *content,
+		bool error) {
+	JsonObject *m = json_object_new();
+	json_object_set_string_member(m, "role", "tool");
+	json_object_set_string_member(m, "id", id);
+	json_object_set_string_member(m, "content", content);
+	json_object_set_boolean_member(m, "error", error);
+	g_hash_table_insert(r->results, g_strdup(id), m);
+}
+
+/* Every call answered: what the tools said goes to the model, in the
+ * order it called them, and the request is next in its queue. */
+static void tools_answered(struct request *r) {
+	for (guint i = 0; i < json_array_get_length(r->turn); i++) {
+		const char *id = json_object_get_string_member(
+			json_array_get_object_element(r->turn, i), "id");
+		JsonObject *m = g_hash_table_lookup(r->results, id);
+		json_array_add_object_element(r->messages, json_object_ref(m));
+	}
+	g_hash_table_remove_all(r->results);
+	g_clear_pointer(&r->turn, json_array_unref);
+	struct queue *q = queue_of(r->profile->name);
+	g_queue_push_head(r->interactive ? &q->interactive : &q->background, r);
+	g_idle_add(start_soon, g_strdup(r->profile->name));
+}
+
+/* The model's turn ended in calls. Each is checked against its tool's
+ * schema: one that doesn't match, or names no tool, is answered here,
+ * saying why; the rest go to the program. Meanwhile someone else can
+ * have this request's place with the provider. */
+static void tools_called(struct request *r, struct call_result *result) {
+	JsonArray *calls = json_array_new();
+	GHashTable *seen = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
+		NULL);
+	for (guint i = 0; i < json_array_get_length(result->calls); i++) {
+		JsonObject *c = json_object_ref(
+			json_array_get_object_element(result->calls, i));
+		const char *id = json_object_get_string_member(c, "id");
+		if (id[0] == '\0' || g_hash_table_contains(seen, id)) {
+			char *made = g_strdup_printf("call_%u", ++r->next_call);
+			json_object_set_string_member(c, "id", made);
+			g_free(made);
+		}
+		g_hash_table_add(seen, g_strdup(json_object_get_string_member(c, "id")));
+		json_array_add_object_element(calls, c);
+	}
+	g_hash_table_unref(seen);
+	JsonObject *m = json_object_new();
+	json_object_set_string_member(m, "role", "assistant");
+	json_object_set_string_member(m, "content", result->text);
+	json_object_set_array_member(m, "calls", json_array_ref(calls));
+	json_array_add_object_element(r->messages, m);
+	r->turn = calls;
+
+	for (guint i = 0; i < json_array_get_length(calls); i++) {
+		JsonObject *c = json_array_get_object_element(calls, i);
+		const char *id = json_object_get_string_member(c, "id");
+		const char *name = json_object_get_string_member(c, "name");
+		JsonObject *tool = tool_of(r, name);
+		char *why = NULL;
+		JsonNode *args = tool != NULL ?
+			schema_parse_answer(json_object_get_string_member(c, "arguments"),
+				&why) : NULL;
+		if (tool == NULL) {
+			why = g_strdup_printf("there's no tool \"%s\"", name);
+		} else if (args != NULL && !schema_check(json_object_get_member(tool,
+				"schema"), args, &why)) {
+			char *w = g_strdup_printf("the arguments don't match the tool's "
+				"schema: %s", why);
+			g_free(why);
+			why = w;
+		}
+		if (why != NULL) {
+			tool_result(r, id, why, true);
+		} else {
+			char *json = json_to_string(args, FALSE);
+			g_hash_table_add(r->waiting, g_strdup(id));
+			g_ptr_array_add(r->called, g_strdup(name));
+			emit(r, "ToolCall", g_variant_new("(sss)", id, name, json));
+			g_free(json);
+		}
+		if (args != NULL) {
+			json_node_unref(args);
+		}
+		g_free(why);
+	}
+
+	if (r->running) {
+		r->running = false;
+		queue_of(r->profile->name)->running--;
+		g_idle_add(start_soon, g_strdup(r->profile->name));
+	}
+	if (g_hash_table_size(r->waiting) == 0) {
+		tools_answered(r);
+	}
+}
+
+/* ToolDone and ToolFailed. */
+static void tool_answer(struct request *r, GVariant *params, bool error,
+		GDBusMethodInvocation *inv) {
+	const char *id, *content;
+	g_variant_get(params, "(&s&s)", &id, &content);
+	if (!g_hash_table_remove(r->waiting, id)) {
+		g_dbus_method_invocation_return_error(inv, G_DBUS_ERROR,
+			G_DBUS_ERROR_INVALID_ARGS, "no call \"%s\" is waiting", id);
+		return;
+	}
+	g_dbus_method_invocation_return_value(inv, NULL);
+	tool_result(r, id, content, error);
+	if (g_hash_table_size(r->waiting) == 0) {
+		tools_answered(r);
+	}
+}
+
 static void answered(struct call_result *result, void *data) {
 	struct request *r = data;
 	if (result->input_tokens >= 0) {
@@ -406,6 +583,14 @@ static void answered(struct call_result *result, void *data) {
 		fail(r, error_for(result->error), result->message);
 		return;
 	}
+	if (result->calls != NULL && json_array_get_length(result->calls) > 0) {
+		if (r->tools != NULL) {
+			tools_called(r, result);
+		} else {
+			fail(r, AUGUR_ERROR_PROVIDER, "the model called a tool it wasn't given");
+		}
+		return;
+	}
 	if (r->schema == NULL) {
 		succeed(r, result->text);
 		return;
@@ -419,6 +604,7 @@ static void answered(struct call_result *result, void *data) {
 		g_free(json);
 	} else if (r->attempts < 2) {
 		/* Once more, saying what was wrong. */
+		r->attempts++;
 		add_message(r, "assistant", result->text);
 		char *again = g_strdup_printf("That doesn't match the JSON Schema: %s. "
 			"Reply again with only JSON that matches it.", why);
@@ -435,13 +621,17 @@ static void answered(struct call_result *result, void *data) {
 }
 
 static void ask_provider(struct request *r) {
-	r->attempts++;
+	r->attempts = MAX(r->attempts, 1);
+	r->rounds++;
 	struct call_spec spec = {
 		.profile = r->profile,
 		.model = r->model,
 		.key = g_hash_table_lookup(srv.keys, r->profile->name),
 		.messages = r->messages,
 		.schema = r->schema,
+		.tools = r->tools,
+		/* The last turn: it answers with what it has. */
+		.tools_off = r->tools != NULL && r->rounds >= r->max_rounds,
 		.max_tokens = r->max_tokens,
 		.temperature = r->temperature,
 	};
@@ -610,6 +800,66 @@ static bool parse_messages(GVariant *v, JsonArray *out, GError **error) {
 	return true;
 }
 
+/* A tool: a name both providers take, a description, and a JSON Schema
+ * for its arguments, which they want to be an object. */
+static bool parse_tool(GVariant *v, JsonArray *out, GError **error) {
+	const char *name = NULL, *description = "", *schema = "{\"type\":\"object\"}";
+	g_variant_lookup(v, "name", "&s", &name);
+	g_variant_lookup(v, "description", "&s", &description);
+	g_variant_lookup(v, "schema", "&s", &schema);
+	if (name == NULL || !g_regex_match_simple("^[A-Za-z0-9_-]{1,64}$", name, 0,
+			0)) {
+		g_set_error_literal(error, G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS,
+			"a tool needs a name: letters, digits, _ and -, up to 64");
+		return false;
+	}
+	if (strcmp(name, RESERVED_TOOL) == 0) {
+		g_set_error(error, G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS,
+			"a tool can't be called \"%s\": Augur's is", RESERVED_TOOL);
+		return false;
+	}
+	for (guint i = 0; i < json_array_get_length(out); i++) {
+		if (strcmp(json_object_get_string_member(
+				json_array_get_object_element(out, i), "name"), name) == 0) {
+			g_set_error(error, G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS,
+				"two tools are called \"%s\"", name);
+			return false;
+		}
+	}
+	char *why = NULL;
+	JsonNode *s = schema_parse_answer(schema, &why);
+	if (s == NULL || !JSON_NODE_HOLDS_OBJECT(s) ||
+			g_strcmp0(json_object_get_string_member_with_default(
+				json_node_get_object(s), "type", ""), "object") != 0) {
+		g_set_error(error, G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS,
+			"tool \"%s\"'s schema isn't a JSON Schema for an object%s%s", name,
+			why != NULL ? ": " : "", why != NULL ? why : "");
+		if (s != NULL) {
+			json_node_unref(s);
+		}
+		g_free(why);
+		return false;
+	}
+	JsonObject *t = json_object_new();
+	json_object_set_string_member(t, "name", name);
+	json_object_set_string_member(t, "description", description);
+	json_object_set_member(t, "schema", s);
+	json_array_add_object_element(out, t);
+	return true;
+}
+
+static bool parse_tools(GVariant *v, JsonArray *out, GError **error) {
+	GVariantIter it;
+	GVariant *t;
+	bool ok = true;
+	g_variant_iter_init(&it, v);
+	while (ok && (t = g_variant_iter_next_value(&it)) != NULL) {
+		ok = parse_tool(t, out, error);
+		g_variant_unref(t);
+	}
+	return ok;
+}
+
 /* Which profile and model, as README.md's "Which model" says. */
 static bool resolve(struct request *r, const char *profile_name,
 		const char *model, const char *tier, GError **error) {
@@ -673,11 +923,16 @@ static struct request *request_new(GVariant *params, const char *sender,
 	r->input_tokens = r->output_tokens = -1;
 	r->temperature = -1;
 	r->messages = json_array_new();
+	r->waiting = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+	r->results = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
+		(GDestroyNotify)json_object_unref);
+	r->called = g_ptr_array_new_with_free_func(g_free);
+	r->max_rounds = MAX_ROUNDS;
 	r->cancel = g_cancellable_new();
 	const char *app_id = NULL, *profile = NULL, *model = NULL, *tier = NULL;
 	const char *schema = NULL;
 	gboolean stream = !is_ask;
-	guint32 max_tokens = 0;
+	guint32 max_tokens = 0, max_rounds = MAX_ROUNDS;
 	double temperature = -1;
 	g_variant_lookup(req, "app-id", "&s", &app_id);
 	g_variant_lookup(req, "profile", "&s", &profile);
@@ -687,7 +942,10 @@ static struct request *request_new(GVariant *params, const char *sender,
 	g_variant_lookup(req, "stream", "b", &stream);
 	g_variant_lookup(req, "max-tokens", "u", &max_tokens);
 	g_variant_lookup(req, "temperature", "d", &temperature);
+	g_variant_lookup(req, "max-rounds", "u", &max_rounds);
 	GVariant *messages = g_variant_lookup_value(req, "messages",
+		G_VARIANT_TYPE("aa{sv}"));
+	GVariant *tools = g_variant_lookup_value(req, "tools",
 		G_VARIANT_TYPE("aa{sv}"));
 	r->app_id = g_strdup(app_id != NULL ? app_id : "");
 	r->stream = stream && !is_ask;
@@ -717,10 +975,28 @@ static struct request *request_new(GVariant *params, const char *sender,
 		}
 		g_free(why);
 	}
+	if (ok && tools != NULL) {
+		if (is_ask) {
+			g_set_error_literal(error, G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS,
+				"tools need Complete: Ask has no handle to call them on");
+			ok = false;
+		} else if (max_rounds < 1) {
+			g_set_error_literal(error, G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS,
+				"max-rounds is at least 1");
+			ok = false;
+		} else {
+			r->tools = json_array_new();
+			ok = parse_tools(tools, r->tools, error);
+		}
+	}
+	r->max_rounds = max_rounds;
 	ok = ok && resolve(r, profile, model, tier, error);
 	r->interactive = r->schema == NULL;
 	if (messages != NULL) {
 		g_variant_unref(messages);
+	}
+	if (tools != NULL) {
+		g_variant_unref(tools);
 	}
 	g_variant_unref(req);
 	if (!ok) {
@@ -761,6 +1037,10 @@ static void request_method(GDBusConnection *bus, const char *sender,
 	if (r == NULL || g_strcmp0(sender, r->sender) != 0) {
 		g_dbus_method_invocation_return_error_literal(inv, G_DBUS_ERROR,
 			G_DBUS_ERROR_ACCESS_DENIED, "not yours");
+		return;
+	}
+	if (strcmp(method, "ToolDone") == 0 || strcmp(method, "ToolFailed") == 0) {
+		tool_answer(r, params, strcmp(method, "ToolFailed") == 0, inv);
 		return;
 	}
 	g_dbus_method_invocation_return_value(inv, NULL);
