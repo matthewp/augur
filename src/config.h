@@ -38,6 +38,7 @@ struct profile {
 	char *model;              /* when nothing more particular is asked */
 	GHashTable *tiers;        /* name -> model */
 	GHashTable *prices;       /* model -> struct price */
+	char *classifier;         /* a model on the System One API, for Classify */
 	enum structured structured;
 	bool stream_usage;        /* ask for token counts in a stream */
 	int max_concurrent;
@@ -46,12 +47,14 @@ struct profile {
 
 struct app_settings {
 	char *profile, *model, *tier;
+	char *classify_profile;
 };
 
 struct config {
 	int refs;
 	bool enabled;             /* [augur] enabled */
 	char *default_profile;
+	char *classify_profile;   /* Classify's, when the app has none */
 	GPtrArray *profiles;      /* struct profile, in the file's order */
 	GHashTable *apps;         /* app ID -> struct app_settings */
 };
@@ -68,5 +71,7 @@ struct profile *config_profile(struct config *c, const char *name);
 /* default_profile, or the first that can be used. */
 struct profile *config_default_profile(struct config *c);
 const struct app_settings *config_app(struct config *c, const char *app_id);
+/* Classify's profile name for an app, or NULL for the default profile. */
+const char *config_classify_profile(struct config *c, const char *app_id);
 
 #endif

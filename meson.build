@@ -23,7 +23,8 @@ libm = meson.get_compiler('c').find_library('m', required: false)
 
 augurd = executable(
 	'augurd',
-	['src/augurd.c', 'src/config.c', 'src/provider.c', 'src/schema.c'],
+	['src/augurd.c', 'src/classify.c', 'src/config.c', 'src/provider.c',
+		'src/schema.c'],
 	dependencies: [glib, gio, gio_unix, json, soup, libm],
 	install: true,
 	install_dir: get_option('libexecdir'),

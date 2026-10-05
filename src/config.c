@@ -25,6 +25,9 @@ static const struct known {
 		false },
 	{ "anthropic", PROVIDER_ANTHROPIC, "https://api.anthropic.com/v1", true,
 		STRUCTURED_NATIVE, true },
+	/* A classifier, Jev, and no chat model. */
+	{ "typesafe", PROVIDER_OPENAI, "https://api.typesafe.ai/v1", true,
+		STRUCTURED_PROMPT, false },
 };
 
 static void profile_free(gpointer p) {
@@ -38,6 +41,7 @@ static void profile_free(gpointer p) {
 	g_free(pr->model);
 	g_hash_table_unref(pr->tiers);
 	g_hash_table_unref(pr->prices);
+	g_free(pr->classifier);
 	g_free(pr->problem);
 	g_free(pr);
 }
@@ -47,6 +51,7 @@ static void app_free(gpointer p) {
 	g_free(a->profile);
 	g_free(a->model);
 	g_free(a->tier);
+	g_free(a->classify_profile);
 	g_free(a);
 }
 
@@ -109,6 +114,7 @@ static struct profile *profile_load(GKeyFile *kf, const char *group,
 	char *bad_price = NULL;
 	p->provider = value(kf, group, "provider");
 	p->model = value(kf, group, "model");
+	p->classifier = value(kf, group, "classifier");
 	p->key_command = value(kf, group, "api-key-command");
 	p->key_env = value(kf, group, "api-key-env");
 	p->gateway_key_command = value(kf, group, "gateway-key-command");
@@ -195,7 +201,8 @@ static struct profile *profile_load(GKeyFile *kf, const char *group,
 	if (p->url == NULL) {
 		p->problem = g_strdup(strcmp(k->name, "cloudflare") == 0 ?
 			"no account (Cloudflare's account ID)" : "no url");
-	} else if (p->model == NULL && g_hash_table_size(p->tiers) == 0) {
+	} else if (p->model == NULL && g_hash_table_size(p->tiers) == 0 &&
+			p->classifier == NULL) {
 		p->problem = g_strdup("no model");
 	} else if (p->needs_key && p->key_command == NULL && p->key_env == NULL) {
 		p->problem = g_strdup("no api-key-command or api-key-env");
@@ -233,6 +240,7 @@ struct config *config_load(const char *path, char **error) {
 		g_free(enabled);
 	}
 	c->default_profile = value(kf, "augur", "default-profile");
+	c->classify_profile = value(kf, "augur", "classify-profile");
 
 	char **groups = g_key_file_get_groups(kf, NULL);
 	for (int i = 0; groups[i] != NULL; i++) {
@@ -246,6 +254,7 @@ struct config *config_load(const char *path, char **error) {
 			a->profile = value(kf, g, "profile");
 			a->model = value(kf, g, "model");
 			a->tier = value(kf, g, "tier");
+			a->classify_profile = value(kf, g, "classify-profile");
 			char *id = g_strstrip(g_strdup(g + 4));
 			g_hash_table_replace(c->apps, id, a);
 		}
@@ -265,6 +274,7 @@ void config_unref(struct config *c) {
 		return;
 	}
 	g_free(c->default_profile);
+	g_free(c->classify_profile);
 	g_ptr_array_unref(c->profiles);
 	g_hash_table_unref(c->apps);
 	g_free(c);
@@ -295,4 +305,10 @@ struct profile *config_default_profile(struct config *c) {
 
 const struct app_settings *config_app(struct config *c, const char *app_id) {
 	return app_id != NULL ? g_hash_table_lookup(c->apps, app_id) : NULL;
+}
+
+const char *config_classify_profile(struct config *c, const char *app_id) {
+	const struct app_settings *a = config_app(c, app_id);
+	return a != NULL && a->classify_profile != NULL ? a->classify_profile :
+		c->classify_profile;
 }

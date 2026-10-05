@@ -6,6 +6,8 @@
  *   augur profiles                  the profiles, and what's wrong with any
  *   augur models [PROFILE]          the models a provider lists
  *   augur usage [OPTIONS]           requests, tokens and what they cost
+ *   augur classify -q FILE [INPUT]  questions about the input (stdin if
+ *                                   not given), answered
  *   augur ask [OPTIONS] [PROMPT]    an answer, as it's written (the prompt
  *                                   from stdin if not given)
  *
@@ -326,6 +328,206 @@ static int cmd_usage(int argc, char *argv[]) {
 	g_variant_unref(rows);
 	g_variant_unref(r);
 	g_strfreev(keys);
+	return 0;
+}
+
+/* ---- classify ---------------------------------------------------------------- */
+
+static char *read_stdin(void);
+
+/* The questions file, {name: {type, instructions, options, yes, no,
+ * levels}}, as Classify takes them. */
+static GVariant *load_questions(const char *path) {
+	GError *error = NULL;
+	JsonParser *parser = json_parser_new();
+	if (!json_parser_load_from_file(parser, path, &error)) {
+		g_printerr("augur: %s\n", error->message);
+		g_error_free(error);
+		g_object_unref(parser);
+		return NULL;
+	}
+	JsonNode *root = json_parser_get_root(parser);
+	if (root == NULL || !JSON_NODE_HOLDS_OBJECT(root)) {
+		g_printerr("augur: %s isn't a JSON object of questions by name\n", path);
+		g_object_unref(parser);
+		return NULL;
+	}
+	JsonObject *all = json_node_get_object(root);
+	GVariantBuilder b;
+	g_variant_builder_init(&b, G_VARIANT_TYPE("a{sv}"));
+	GList *names = json_object_get_members(all);
+	for (GList *l = names; l != NULL; l = l->next) {
+		JsonNode *n = json_object_get_member(all, l->data);
+		if (!JSON_NODE_HOLDS_OBJECT(n)) {
+			continue;   /* augurd says what's wrong with what's left */
+		}
+		JsonObject *q = json_node_get_object(n);
+		GVariantBuilder qb;
+		g_variant_builder_init(&qb, G_VARIANT_TYPE("a{sv}"));
+		const char *strings[] = { "type", "instructions", "yes", "no" };
+		for (size_t i = 0; i < G_N_ELEMENTS(strings); i++) {
+			const char *v = json_object_get_string_member_with_default(q,
+				strings[i], NULL);
+			if (v != NULL) {
+				g_variant_builder_add(&qb, "{sv}", strings[i], g_variant_new_string(v));
+			}
+		}
+		JsonNode *options = json_object_get_member(q, "options");
+		if (options != NULL && JSON_NODE_HOLDS_OBJECT(options)) {
+			JsonObject *o = json_node_get_object(options);
+			GVariantBuilder ob;
+			g_variant_builder_init(&ob, G_VARIANT_TYPE("a{ss}"));
+			GList *opts = json_object_get_members(o);
+			for (GList *x = opts; x != NULL; x = x->next) {
+				g_variant_builder_add(&ob, "{ss}", (const char *)x->data,
+					json_object_get_string_member_with_default(o, x->data, ""));
+			}
+			g_list_free(opts);
+			g_variant_builder_add(&qb, "{sv}", "options", g_variant_builder_end(&ob));
+		}
+		JsonNode *levels = json_object_get_member(q, "levels");
+		if (levels != NULL && JSON_NODE_HOLDS_ARRAY(levels)) {
+			JsonArray *a = json_node_get_array(levels);
+			GVariantBuilder lb;
+			g_variant_builder_init(&lb, G_VARIANT_TYPE("as"));
+			for (guint i = 0; i < json_array_get_length(a); i++) {
+				JsonNode *e = json_array_get_element(a, i);
+				g_variant_builder_add(&lb, "s", JSON_NODE_HOLDS_VALUE(e) &&
+					json_node_get_string(e) != NULL ? json_node_get_string(e) : "");
+			}
+			g_variant_builder_add(&qb, "{sv}", "levels", g_variant_builder_end(&lb));
+		}
+		g_variant_builder_add(&b, "{sv}", (const char *)l->data,
+			g_variant_builder_end(&qb));
+	}
+	g_list_free(names);
+	g_object_unref(parser);
+	return g_variant_builder_end(&b);
+}
+
+/* An answer as a line: "team: returns (0.70)", "human: 0.93",
+ * "severity: 1.43". */
+static void print_answer(const char *name, GVariant *a) {
+	const char *choice = NULL;
+	double p = -1, score = -1, confidence = -1;
+	g_variant_lookup(a, "choice", "&s", &choice);
+	g_variant_lookup(a, "probability", "d", &p);
+	g_variant_lookup(a, "score", "d", &score);
+	g_variant_lookup(a, "confidence", "d", &confidence);
+	if (choice != NULL) {
+		double cp = -1;
+		GVariant *probs = g_variant_lookup_value(a, "probabilities",
+			G_VARIANT_TYPE("a{sd}"));
+		if (probs != NULL) {
+			g_variant_lookup(probs, choice, "d", &cp);
+			g_variant_unref(probs);
+		}
+		if (cp >= 0) {
+			printf("%s: %s (%.2f)\n", name, choice, cp);
+		} else {
+			printf("%s: %s\n", name, choice);
+		}
+	} else if (p >= 0) {
+		printf("%s: %.2f\n", name, p);
+	} else if (confidence >= 0) {
+		printf("%s: %.2f (confidence %.2f)\n", name, score, confidence);
+	} else {
+		printf("%s: %.0f\n", name, score);
+	}
+}
+
+static int cmd_classify(int argc, char *argv[]) {
+	char *file = NULL, *profile = NULL, *model = NULL, *app_id = NULL;
+	gboolean json = FALSE, verbose = FALSE;
+	GOptionEntry entries[] = {
+		{ "questions", 'q', 0, G_OPTION_ARG_FILENAME, &file,
+			"The questions, a JSON file: {name: {type, instructions, options, "
+			"yes, no, levels}}", "FILE" },
+		{ "profile", 'p', 0, G_OPTION_ARG_STRING, &profile, "Profile", "NAME" },
+		{ "model", 'm', 0, G_OPTION_ARG_STRING, &model, "Model", "MODEL" },
+		{ "app-id", 0, 0, G_OPTION_ARG_STRING, &app_id,
+			"Ask as this program (for its [app] settings)", "ID" },
+		{ "json", 0, 0, G_OPTION_ARG_NONE, &json, "Print the answers as JSON",
+			NULL },
+		{ "verbose", 'v', 0, G_OPTION_ARG_NONE, &verbose,
+			"Say what answered: a classifier or a chat model, and the tokens",
+			NULL },
+		{ NULL, 0, 0, 0, NULL, NULL, NULL },
+	};
+	GOptionContext *ctx = g_option_context_new("classify [INPUT...]");
+	g_option_context_add_main_entries(ctx, entries, NULL);
+	GError *error = NULL;
+	if (!g_option_context_parse(ctx, &argc, &argv, &error)) {
+		g_printerr("augur: %s\n", error->message);
+		return 2;
+	}
+	g_option_context_free(ctx);
+	if (file == NULL) {
+		g_printerr("augur: classify needs --questions FILE\n");
+		return 2;
+	}
+	GVariant *questions = load_questions(file);
+	if (questions == NULL) {
+		return 2;
+	}
+	char *input = argc > 1 ? g_strjoinv(" ", argv + 1) : read_stdin();
+	GVariantBuilder req;
+	g_variant_builder_init(&req, G_VARIANT_TYPE("a{sv}"));
+	g_variant_builder_add(&req, "{sv}", "app-id",
+		g_variant_new_string(app_id != NULL ? app_id : "augur"));
+	g_variant_builder_add(&req, "{sv}", "input", g_variant_new_string(input));
+	g_variant_builder_add(&req, "{sv}", "questions", questions);
+	g_variant_builder_add(&req, "{sv}", "interactive",
+		g_variant_new_boolean(TRUE));
+	if (profile != NULL) {
+		g_variant_builder_add(&req, "{sv}", "profile", g_variant_new_string(profile));
+	}
+	if (model != NULL) {
+		g_variant_builder_add(&req, "{sv}", "model", g_variant_new_string(model));
+	}
+	GVariant *r = call("Classify", g_variant_new("(a{sv})", &req),
+		"(a{sv}a{sv})", &error);
+	g_free(input);
+	if (r == NULL) {
+		print_error(error);
+		g_error_free(error);
+		return 1;
+	}
+	GVariant *answers = g_variant_get_child_value(r, 0);
+	GVariant *info = g_variant_get_child_value(r, 1);
+	if (json) {
+		char *text = json_gvariant_serialize_data(answers, NULL);
+		printf("%s\n", text);
+		g_free(text);
+	} else {
+		GVariantIter it;
+		const char *name;
+		GVariant *a;
+		g_variant_iter_init(&it, answers);
+		while (g_variant_iter_next(&it, "{&sv}", &name, &a)) {
+			print_answer(name, a);
+			g_variant_unref(a);
+		}
+	}
+	if (verbose) {
+		gboolean calibrated = FALSE;
+		g_variant_lookup(info, "calibrated", "b", &calibrated);
+		const char *how = calibrated ? "a classifier" : "a chat model, uncalibrated";
+		const char *p = "", *m = "";
+		g_variant_lookup(info, "profile", "&s", &p);
+		g_variant_lookup(info, "model", "&s", &m);
+		gint64 in = -1;
+		double cost = -1;
+		g_variant_lookup(info, "input-tokens", "x", &in);
+		g_variant_lookup(info, "cost", "d", &cost);
+		char *c = cost >= 0 ? format_cost(cost) : NULL;
+		g_printerr("[%s, %s: %s, %" G_GINT64_FORMAT " in%s%s]\n", p, m, how, in,
+			c != NULL ? ", " : "", c != NULL ? c : "");
+		g_free(c);
+	}
+	g_variant_unref(answers);
+	g_variant_unref(info);
+	g_variant_unref(r);
 	return 0;
 }
 
@@ -670,6 +872,8 @@ static void usage(FILE *to) {
 		"       augur profiles\n"
 		"       augur models [PROFILE]\n"
 		"       augur usage [--since WHEN] [--until WHEN] [--by KEYS] [--app ID]\n"
+		"       augur classify -q FILE [-p PROFILE] [-m MODEL] [--json] [-v]\n"
+		"                 [INPUT...]\n"
 		"       augur ask [-p PROFILE] [-m MODEL] [-t TIER] [-s SYSTEM]\n"
 		"                 [--schema JSON|@FILE] [--tools FILE] [--max-rounds N]\n"
 		"                 [--no-stream] [-v] [PROMPT...]\n"
@@ -708,6 +912,9 @@ int main(int argc, char *argv[]) {
 	}
 	if (strcmp(cmd, "usage") == 0) {
 		return cmd_usage(argc - 1, argv + 1);
+	}
+	if (strcmp(cmd, "classify") == 0) {
+		return cmd_classify(argc - 1, argv + 1);
 	}
 	g_printerr("augur: no command \"%s\"\n", cmd);
 	usage(stderr);

@@ -58,6 +58,14 @@ typedef void (*call_done_fn)(struct call_result *result, void *data);
 void call_start(SoupSession *session, const struct call_spec *spec,
 	GCancellable *cancel, call_delta_fn delta, call_done_fn done, void *data);
 
+/* A classifier's answers to questions about an input, from Typesafe's
+ * System One API at the profile's url: done gets the reply's "answers" as
+ * JSON text (or what went wrong), once. questions are Jev's own (see
+ * classify_jev_questions). */
+void call_systemone(SoupSession *session, const struct call_spec *spec,
+	const char *input, JsonNode *questions, GCancellable *cancel,
+	call_done_fn done, void *data);
+
 /* The models a provider lists (char *), or NULL and why. */
 typedef void (*models_fn)(GPtrArray *models, const char *error, void *data);
 void call_list_models(SoupSession *session, const struct profile *p,

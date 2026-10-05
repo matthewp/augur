@@ -15,12 +15,17 @@
  * the provider, and it waits for the program's ToolDone or ToolFailed for
  * each; then it's next in its profile's queue, and the model is asked
  * again with what the tools said.
+ *
+ * Classify asks questions about an input: of the profile's classifier
+ * over the System One API (provider.c), or else of its chat model, the
+ * questions made a schema (classify.c); the same answers either way.
  */
 #include <gio/gio.h>
 #include <glib-unix.h>
 #include <glib/gstdio.h>
 #include <math.h>
 #include <string.h>
+#include "classify.h"
 #include "config.h"
 #include "provider.h"
 #include "schema.h"
@@ -46,6 +51,11 @@ static const char introspection[] =
 	"  <method name='Ask'>"
 	"   <arg name='request' type='a{sv}' direction='in'/>"
 	"   <arg name='text' type='s' direction='out'/>"
+	"   <arg name='info' type='a{sv}' direction='out'/>"
+	"  </method>"
+	"  <method name='Classify'>"
+	"   <arg name='request' type='a{sv}' direction='in'/>"
+	"   <arg name='answers' type='a{sv}' direction='out'/>"
 	"   <arg name='info' type='a{sv}' direction='out'/>"
 	"  </method>"
 	"  <method name='Status'>"
@@ -122,7 +132,11 @@ struct request {
 	char *path;           /* NULL for Ask */
 	guint registration;
 	char *sender;
-	GDBusMethodInvocation *ask;
+	GDBusMethodInvocation *ask;  /* Ask's or Classify's, to return to */
+	bool classify;        /* Classify's: questions about an input */
+	bool classifier;      /* ... answered by a classifier, not a chat model */
+	char *input;
+	JsonObject *questions;
 	char *app_id;
 	struct config *config;
 	struct profile *profile;
@@ -288,6 +302,17 @@ static void log_request(struct request *r, const char *result) {
 	}
 	json_builder_set_member_name(b, "attempts");
 	json_builder_add_int_value(b, r->attempts);
+	if (r->classify) {
+		/* Which questions, never what they asked or about what. */
+		json_builder_set_member_name(b, "questions");
+		json_builder_begin_array(b);
+		GList *names = r->questions != NULL ? classify_names(r->questions) : NULL;
+		for (GList *l = names; l != NULL; l = l->next) {
+			json_builder_add_string_value(b, l->data);
+		}
+		g_list_free(names);
+		json_builder_end_array(b);
+	}
 	if (r->tools != NULL) {
 		/* Which tools, never what they were given or said. */
 		json_builder_set_member_name(b, "rounds");
@@ -338,6 +363,10 @@ static void request_free(struct request *r) {
 	g_free(r->sender);
 	g_free(r->app_id);
 	g_free(r->model);
+	g_free(r->input);
+	if (r->questions != NULL) {
+		json_object_unref(r->questions);
+	}
 	if (r->messages != NULL) {
 		json_array_unref(r->messages);
 	}
@@ -398,8 +427,13 @@ static GVariant *info_of(struct request *r) {
 	g_variant_builder_add(&b, "{sv}", "attempts",
 		g_variant_new_int32(r->attempts));
 	g_variant_builder_add(&b, "{sv}", "rounds", g_variant_new_int32(r->rounds));
-	g_variant_builder_add(&b, "{sv}", "tool-calls",
-		g_variant_new_int32(r->called->len));
+	if (r->classify) {
+		g_variant_builder_add(&b, "{sv}", "calibrated",
+			g_variant_new_boolean(r->classifier));
+	} else {
+		g_variant_builder_add(&b, "{sv}", "tool-calls",
+			g_variant_new_int32(r->called->len));
+	}
 	return g_variant_builder_end(&b);
 }
 
@@ -412,7 +446,30 @@ static void emit(struct request *r, const char *signal, GVariant *args) {
 		signal, args, NULL);
 }
 
+static void fail(struct request *r, enum augur_error code, const char *message);
+
+/* Classify's answer: Jev's, or the chat model's checked JSON. */
+static void classified(struct request *r, const char *text) {
+	char *why = NULL;
+	GVariant *answers = r->classifier ?
+		classify_answers_from_jev(r->questions, text, &why) :
+		classify_answers_from_chat(r->questions, text);
+	if (answers == NULL) {
+		fail(r, AUGUR_ERROR_PROVIDER, why);
+		g_free(why);
+		return;
+	}
+	g_dbus_method_invocation_return_value(r->ask,
+		g_variant_new("(@a{sv}@a{sv})", answers, info_of(r)));
+	r->ask = NULL;
+	request_end(r, "ok");
+}
+
 static void succeed(struct request *r, const char *text) {
+	if (r->classify) {
+		classified(r, text);
+		return;
+	}
 	if (r->ask != NULL) {
 		g_dbus_method_invocation_return_value(r->ask,
 			g_variant_new("(s@a{sv})", text, info_of(r)));
@@ -687,6 +744,13 @@ static void ask_provider(struct request *r) {
 	char *gw = g_strdup_printf("%s\x01gw", r->profile->name);
 	spec.gateway_key = g_hash_table_lookup(srv.keys, gw);
 	g_free(gw);
+	if (r->classifier) {
+		JsonNode *questions = classify_jev_questions(r->questions);
+		call_systemone(srv.soup, &spec, r->input, questions, r->cancel, answered,
+			r);
+		json_node_unref(questions);
+		return;
+	}
 	call_start(srv.soup, &spec, r->cancel, delta, answered, r);
 }
 
@@ -958,14 +1022,8 @@ static bool resolve(struct request *r, const char *profile_name,
 	return true;
 }
 
-static struct request *request_new(GVariant *params, const char *sender,
-		bool is_ask, GError **error) {
-	if (!srv.enabled) {
-		g_set_error_literal(error, AUGUR_ERROR, AUGUR_ERROR_DISABLED,
-			"Augur is turned off");
-		return NULL;
-	}
-	GVariant *req = g_variant_get_child_value(params, 0);
+/* A request, before what it asks is read. */
+static struct request *request_alloc(const char *sender) {
 	struct request *r = g_new0(struct request, 1);
 	r->config = config_ref(srv.config);
 	r->sender = g_strdup(sender);
@@ -978,6 +1036,25 @@ static struct request *request_new(GVariant *params, const char *sender,
 	r->called = g_ptr_array_new_with_free_func(g_free);
 	r->max_rounds = MAX_ROUNDS;
 	r->cancel = g_cancellable_new();
+	return r;
+}
+
+/* It's in the table, and augurd stays while it's there. */
+static void request_add(struct request *r) {
+	r->id = ++srv.next_id;
+	g_hash_table_insert(srv.requests, GUINT_TO_POINTER(r->id), r);
+	busy(+1);
+}
+
+static struct request *request_new(GVariant *params, const char *sender,
+		bool is_ask, GError **error) {
+	if (!srv.enabled) {
+		g_set_error_literal(error, AUGUR_ERROR, AUGUR_ERROR_DISABLED,
+			"Augur is turned off");
+		return NULL;
+	}
+	GVariant *req = g_variant_get_child_value(params, 0);
+	struct request *r = request_alloc(sender);
 	const char *app_id = NULL, *profile = NULL, *model = NULL, *tier = NULL;
 	const char *schema = NULL;
 	gboolean stream = !is_ask;
@@ -1052,9 +1129,86 @@ static struct request *request_new(GVariant *params, const char *sender,
 		request_free(r);
 		return NULL;
 	}
-	r->id = ++srv.next_id;
-	g_hash_table_insert(srv.requests, GUINT_TO_POINTER(r->id), r);
-	busy(+1);
+	request_add(r);
+	return r;
+}
+
+/* Classify's profile, and whether its classifier answers or its chat
+ * model does: design/classify.md's "which profile". */
+static bool resolve_classify(struct request *r, const char *profile_name,
+		const char *model, GError **error) {
+	const char *name = profile_name != NULL ? profile_name :
+		config_classify_profile(r->config, r->app_id);
+	struct profile *p = name != NULL ? config_profile(r->config, name) :
+		config_default_profile(r->config);
+	if (p != NULL && p->problem == NULL && p->classifier != NULL) {
+		r->profile = p;
+		r->classifier = true;
+		r->model = g_strdup(model != NULL ? model : p->classifier);
+		return true;
+	}
+	/* No classifier: the chat model, found as for Complete (and the errors
+	 * for no profile, or a broken one, from there). */
+	return resolve(r, p != NULL ? p->name : name, model, NULL, error);
+}
+
+static struct request *classify_new(GVariant *params, const char *sender,
+		GError **error) {
+	if (!srv.enabled) {
+		g_set_error_literal(error, AUGUR_ERROR, AUGUR_ERROR_DISABLED,
+			"Augur is turned off");
+		return NULL;
+	}
+	GVariant *req = g_variant_get_child_value(params, 0);
+	struct request *r = request_alloc(sender);
+	r->classify = true;
+	r->questions = json_object_new();
+	const char *app_id = NULL, *input = NULL, *profile = NULL, *model = NULL;
+	gboolean interactive = FALSE;
+	g_variant_lookup(req, "app-id", "&s", &app_id);
+	g_variant_lookup(req, "input", "&s", &input);
+	g_variant_lookup(req, "profile", "&s", &profile);
+	g_variant_lookup(req, "model", "&s", &model);
+	g_variant_lookup(req, "interactive", "b", &interactive);
+	GVariant *questions = g_variant_lookup_value(req, "questions",
+		G_VARIANT_TYPE("a{sv}"));
+	r->app_id = g_strdup(app_id != NULL ? app_id : "");
+	r->input = g_strdup(input);
+	r->interactive = interactive;
+	bool ok = true;
+	if (app_id == NULL || app_id[0] == '\0') {
+		g_set_error_literal(error, G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS,
+			"app-id is needed: who's asking");
+		ok = false;
+	} else if (input == NULL) {
+		g_set_error_literal(error, G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS,
+			"input is needed (s): what the questions are about");
+		ok = false;
+	} else if (questions == NULL) {
+		g_set_error_literal(error, G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS,
+			"questions is needed (a{sv}: each by name, an a{sv})");
+		ok = false;
+	} else {
+		ok = classify_parse(questions, r->questions, error);
+	}
+	ok = ok && resolve_classify(r, profile, model, error);
+	if (ok && !r->classifier) {
+		/* The questions as a schema, asked of the chat model. */
+		r->schema = classify_schema(r->questions);
+		char *prompt = classify_prompt(r->questions);
+		add_message(r, "system", prompt);
+		add_message(r, "user", r->input);
+		g_free(prompt);
+	}
+	if (questions != NULL) {
+		g_variant_unref(questions);
+	}
+	g_variant_unref(req);
+	if (!ok) {
+		request_free(r);
+		return NULL;
+	}
+	request_add(r);
 	return r;
 }
 
@@ -1403,6 +1557,14 @@ static void method(GDBusConnection *bus, const char *sender, const char *path,
 			g_dbus_method_invocation_return_value(inv,
 				g_variant_new("(o)", r->path));
 		}
+		enqueue(r);
+	} else if (strcmp(name, "Classify") == 0) {
+		struct request *r = classify_new(params, sender, &error);
+		if (r == NULL) {
+			return_gerror(inv, error);
+			return;
+		}
+		r->ask = inv;
 		enqueue(r);
 	} else if (strcmp(name, "Status") == 0) {
 		g_dbus_method_invocation_return_value(inv,

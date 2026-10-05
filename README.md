@@ -52,6 +52,7 @@ Then write `~/.config/augur/config` (below) and ask it something:
     augur ask --tools tools.json "What's the weather in Paris?"
     augur usage                  # this month's requests, tokens and cost, by app
     augur usage --since week --by model,day
+    augur classify -q questions.json "Your invoice is attached"
 
 A tools file is a JSON array of `{name, description, schema, command}`: a
 call's arguments go to the command on stdin, what it prints is the result,
@@ -71,6 +72,10 @@ and if it fails, what it printed to stderr is why.
 - **Tools without the loop.** A program offers the model tools and gets
   their calls as signals, with arguments already checked against the
   tool's schema; Augur carries the conversation to the answer.
+- **Questions with probabilities.** A program asks questions about some
+  text (which of these? yes or no? how much?) and gets answers with how
+  likely each is: from a classifier model like Jev, or from a chat model
+  when there's none, the same way.
 - **One switch.** Programs ask whether AI is on and show or hide their AI
   features to match.
 
@@ -103,6 +108,7 @@ The interface carries a version (`Augur1`); an incompatible change is
 [augur]
 enabled = true
 default-profile = cloud
+classify-profile = openrouter       # Classify's, unless the app's says
 
 [profile cloud]
 provider = cloudflare
@@ -124,23 +130,31 @@ tier.smart = claude-opus-5-5
 provider = ollama
 model = qwen3:8b
 
+[profile openrouter]
+provider = openrouter
+api-key-command = pass show openrouter
+model = deepseek/deepseek-v4-flash
+classifier = typesafe/jev-1.13
+
 # Per program, by app ID: which profile, and what it uses.
 [app org.gemwm.GemMail]
 profile = cloud
 model = deepseek-v4-flash
+classify-profile = openrouter
 ```
 
 A profile's settings:
 
 | Key | Meaning |
 |-----|---------|
-| `provider` | `openai`, `anthropic`, `openrouter`, `cloudflare`, `ollama`, or `openai-compatible` |
+| `provider` | `openai`, `anthropic`, `openrouter`, `cloudflare`, `ollama`, `openai-compatible`, or `typesafe` (a classifier, and no chat model) |
 | `url` | the API's base (with its `/v1`), for `openai-compatible`, or to point any provider elsewhere |
 | `account`, `gateway` | Cloudflare: the account ID and gateway (`default` if not given); models are named `provider/model` there, e.g. `workers-ai/@cf/meta/llama-3.1-8b-instruct` |
 | `api-key-command` | prints the key (its first line is used) |
 | `api-key-env` | or: the variable holding it |
 | `gateway-key-command` | Cloudflare: prints the token for an authenticated gateway |
 | `model` | the model when nothing more particular is asked |
+| `classifier` | a classifier model, which `Classify` asks over Typesafe's System One API at `{url}/systemone`: Typesafe's own (`jev-1.13.0`) and OpenRouter's (`typesafe/jev-1.13`) |
 | `tier.NAME` | a model for the tier NAME |
 | `structured-output` | `native` (the provider's own) or `prompt` (the schema in the prompt); the default suits the provider |
 | `max-concurrent` | requests to it at once (4) |
@@ -206,6 +220,9 @@ interface io.github.matthewp.Augur1
 
   # The same, waiting for the whole answer: the simple case.
   method Ask(request: a{sv}) -> (text: s, info: a{sv})
+
+  # Questions about an input, answered: see "Classify" below.
+  method Classify(request: a{sv}) -> (answers: a{sv}, info: a{sv})
 
   method Status() -> (status: a{sv})       # enabled, config, default-profile,
                                            # problem (why it's off), running
@@ -301,6 +318,54 @@ be the name of a program's tool.
 Tools need a handle to call back on: `Ask` with `tools` is
 `InvalidArgs`. The log has the tools called, by name, never their
 arguments or results.
+
+### Classify
+
+Questions about an input, answered from fixed answers with how likely
+each is. A classifier answers where the profile has one (`classifier`);
+else the profile's chat model does, the questions made a JSON Schema and
+asked as a structured answer. The program asks the same way either way.
+`design/classify.md` has why, and Jev.
+
+The profile is the request's, else the `[app]` section's
+`classify-profile`, else `[augur] classify-profile`, else the default
+profile. The model is the request's, else the profile's `classifier`,
+else its chat model, as for `Complete`.
+
+The request:
+
+| Key | Type | Meaning |
+|-----|------|---------|
+| `app-id` | s | who's asking (required) |
+| `input` | s | what the questions are about (required) |
+| `questions` | a{sv} | by name (letters, digits, `_`, `-`), each an `a{sv}` (below; at least one) |
+| `profile`, `model` | s | optional |
+| `interactive` | b | someone's waiting for it: ahead of background work in the queue (default false) |
+
+A question:
+
+| Key | Type | Meaning |
+|-----|------|---------|
+| `type` | s | `choice`, `yes-no` or `score` |
+| `instructions` | s | the question (required) |
+| `options` | a{ss} | `choice`: each option's name and what it means (2 to 255) |
+| `yes`, `no` | s | `yes-no`, optional: what counts as each |
+| `levels` | as | `score`: each level described, lowest first (at least 2) |
+
+The answers, by the question's name, each an `a{sv}`:
+
+| Type | Keys |
+|------|------|
+| `choice` | `choice` (s); from a classifier also `confidence` (d) and `probabilities` (a{sd}: every option's) |
+| `yes-no` | `probability` (d): that it's yes; 0 or 1 from a chat model |
+| `score` | `score` (d: 0 to the levels less one; a chat model's a whole level); from a classifier also `confidence` (d) and `probabilities` (ad: each level's) |
+
+`info`: `profile`, `model`, `calibrated` (b: a classifier's
+probabilities, which mean the same from one question to the next),
+the tokens and `cost`, as for `Complete`. A chat model's probabilities
+aren't made up: it has none to give.
+
+The log has the questions' names, never the input or the answers.
 
 Errors, each `io.github.matthewp.Augur1.Error.` and: `Disabled`,
 `NoProfile`, `NoModel`, `Auth` (the key was refused or couldn't be got),

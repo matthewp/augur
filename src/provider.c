@@ -875,6 +875,106 @@ void call_start(SoupSession *session, const struct call_spec *spec,
 		sent, c);
 }
 
+/* ---- A classifier ------------------------------------------------------------ */
+
+struct systemone {
+	SoupMessage *msg;
+	call_done_fn done;
+	void *data;
+};
+
+static void systemone_read(GObject *src, GAsyncResult *res, gpointer data) {
+	struct systemone *s = data;
+	GError *err = NULL;
+	GBytes *bytes = soup_session_send_and_read_finish(SOUP_SESSION(src), res,
+		&err);
+	int status = soup_message_get_status(s->msg);
+	gsize len = 0;
+	const char *body = bytes != NULL ? g_bytes_get_data(bytes, &len) : NULL;
+	char *text = body != NULL ? g_strndup(body, len) : NULL;
+	struct call_result r = { CALL_OK, NULL, NULL, NULL, -1, -1, -1, -1 };
+	JsonParser *parser = json_parser_new();
+	if (bytes == NULL) {
+		bool cancelled = g_error_matches(err, G_IO_ERROR, G_IO_ERROR_CANCELLED);
+		r.error = cancelled ? CALL_CANCELLED : CALL_PROVIDER;
+		r.message = g_strdup(cancelled ? "cancelled" : err->message);
+	} else if (status < 200 || status >= 300) {
+		char *type = NULL;
+		r.message = error_message(text, status, &type);
+		/* 529: overloaded, which is to say come back later. */
+		r.error = status == 529 ? CALL_RATE_LIMITED : error_kind(status, type);
+		g_free(type);
+	} else if (!json_parser_load_from_data(parser, text, -1, NULL) ||
+			!JSON_NODE_HOLDS_OBJECT(json_parser_get_root(parser)) ||
+			!json_object_has_member(json_node_get_object(
+				json_parser_get_root(parser)), "answers")) {
+		r.error = CALL_PROVIDER;
+		r.message = g_strdup("the classifier's reply has no answers");
+	} else {
+		JsonObject *o = json_node_get_object(json_parser_get_root(parser));
+		r.text = json_to_string(json_object_get_member(o, "answers"), FALSE);
+		JsonNode *usage = json_object_get_member(o, "usage");
+		if (usage != NULL && JSON_NODE_HOLDS_OBJECT(usage)) {
+			JsonObject *u = json_node_get_object(usage);
+			r.input_tokens = json_object_get_int_member_with_default(u,
+				"input_tokens", -1);
+			r.output_tokens = json_object_get_int_member_with_default(u,
+				"output_tokens", -1);
+			JsonNode *cost = json_object_get_member(u, "cost");
+			if (cost != NULL && JSON_NODE_HOLDS_VALUE(cost)) {
+				r.cost = json_node_get_double(cost);
+			}
+		}
+	}
+	s->done(&r, s->data);
+	g_free(r.text);
+	g_free(r.message);
+	g_object_unref(parser);
+	g_free(text);
+	if (bytes != NULL) {
+		g_bytes_unref(bytes);
+	}
+	g_clear_error(&err);
+	g_object_unref(s->msg);
+	g_free(s);
+}
+
+void call_systemone(SoupSession *session, const struct call_spec *spec,
+		const char *input, JsonNode *questions, GCancellable *cancel,
+		call_done_fn done, void *data) {
+	char *url = g_strdup_printf("%s/systemone", spec->profile->url);
+	SoupMessage *msg = soup_message_new(SOUP_METHOD_POST, url);
+	g_free(url);
+	if (msg == NULL) {
+		char *m = g_strdup_printf("the profile's url isn't one: %s",
+			spec->profile->url);
+		struct call_result r = { CALL_PROVIDER, m, NULL, NULL, -1, -1, -1, -1 };
+		done(&r, data);
+		g_free(m);
+		return;
+	}
+	JsonObject *o = json_object_new();
+	json_object_set_string_member(o, "model", spec->model);
+	json_object_set_string_member(o, "state", input);
+	json_object_set_member(o, "questions", json_node_copy(questions));
+	JsonNode *root = json_node_init_object(json_node_alloc(), o);
+	char *json = json_to_string(root, FALSE);
+	json_node_unref(root);
+	json_object_unref(o);
+	GBytes *bytes = g_bytes_new_take(json, strlen(json));
+	soup_message_set_request_body_from_bytes(msg, "application/json", bytes);
+	g_bytes_unref(bytes);
+	set_headers(msg, spec);
+	soup_message_headers_replace(soup_message_get_request_headers(msg),
+		"Accept", "application/json");
+	struct systemone *s = g_new0(struct systemone, 1);
+	s->msg = msg;
+	s->done = done;
+	s->data = data;
+	soup_session_send_and_read_async(session, msg, G_PRIORITY_DEFAULT, cancel,
+		systemone_read, s);
+}
+
 /* ---- Models --------------------------------------------------------------- */
 
 struct listing {

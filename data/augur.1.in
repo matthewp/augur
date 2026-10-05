@@ -9,6 +9,17 @@ augur \- ask Augur, the desktop's AI service, from the shell
 .B augur models
 .RI [ PROFILE ]
 .br
+.B augur classify
+.B \-q
+.I FILE
+.RB [ \-p
+.IR PROFILE ]
+.RB [ \-m
+.IR MODEL ]
+.RB [ \-\-json ]
+.RB [ \-v ]
+.RI [ INPUT ...]
+.br
 .B augur usage
 .RB [ \-\-since
 .IR WHEN ]
@@ -64,6 +75,33 @@ wrong with any that can't be used.
 .BR models " [\fIPROFILE\fR]"
 The models the profile's provider lists (the default profile's if none
 is named).
+.TP
+.BR classify " \fB\-q\fR \fIFILE\fR [\fIOPTIONS\fR] [\fIINPUT\fR...]"
+Asks questions about the input (stdin when it isn't given) and prints
+each answer.
+.I FILE
+is a JSON object of questions by name, each with a
+.B type
+.RB ( choice ", " yes\-no
+or
+.BR score ),
+.BR instructions ,
+and for a choice its
+.B options
+(an object of names and what they mean), for a yes\-no what counts as
+.B yes
+and
+.B no
+if it helps, and for a score its
+.B levels
+(an array, lowest first).
+A profile with a
+.B classifier
+answers with probabilities; one without, with its chat model.
+.B \-\-json
+prints the answers as JSON;
+.B \-v
+says what answered.
 .TP
 .BR usage " [\fIOPTIONS\fR]"
 Requests, tokens and what they cost, from the log: this month's, by

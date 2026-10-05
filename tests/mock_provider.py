@@ -19,6 +19,13 @@ The prompt can also say:
     badargs  call it first with arguments that don't fit
     loop     never stop calling it
 Told it can't call tools (tool_choice none) it answers "No more tools".
+
+Any other schema gets an answer that fits it (the first of an enum, true,
+an integer's maximum).
+
+/systemone answers as Jev would: a choice its first option (0.7), a noul
+0.93 if the state mentions a bill (else 0.04), a score of three levels
+1.43; a state saying "overloaded" gets a 529.
 """
 import json
 import sys
@@ -47,6 +54,22 @@ def tool_calls(prompt, tools, messages):
     if "badargs" in prompt and first:
         return [(name, {"bogus": True})]
     return [(name, {"city": "Paris"})]
+
+
+def example(schema):
+    """A value that fits the schema."""
+    if "enum" in schema:
+        return schema["enum"][0]
+    t = schema.get("type")
+    if t == "object":
+        return {k: example(v) for k, v in schema.get("properties", {}).items()}
+    if t == "array":
+        return [example(schema.get("items", {}))]
+    if t == "boolean":
+        return True
+    if t == "integer":
+        return schema.get("maximum", 1)
+    return "text"
 
 
 def has_assistant(messages):
@@ -102,7 +125,9 @@ class Handler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length) or b"{}")
         self.record(body)
         try:
-            if self.path.endswith("/chat/completions"):
+            if self.path.endswith("/systemone"):
+                self.systemone(body)
+            elif self.path.endswith("/chat/completions"):
                 self.openai(body)
             elif self.path.endswith("/messages"):
                 self.anthropic(body)
@@ -131,7 +156,12 @@ class Handler(BaseHTTPRequestHandler):
         if tools:
             self.openai_tools(body, prompt, tools, messages)
             return
-        if "response_format" in body:
+        schema = body.get("response_format", {}).get("json_schema", {}) \
+            .get("schema", {})
+        if "response_format" in body and \
+                "categories" not in schema.get("properties", {}):
+            pieces = [json.dumps(example(schema))]
+        elif "response_format" in body:
             wrong = "retry" in prompt and not has_assistant(messages)
             text = json.dumps({"categories": ["cats" if wrong else "bill"]})
             pieces = [text[:10], text[10:]]
@@ -179,6 +209,45 @@ class Handler(BaseHTTPRequestHandler):
                         "index": i, "function": {"arguments": text[j:j + 5]}}]}}]})
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
+
+    # ---- System One -----------------------------------------------------
+
+    def systemone(self, body):
+        if self.headers.get("Authorization") != f"Bearer {OPENAI_KEY}":
+            self.send_json(401, {"error": {"message": "Incorrect API key"}})
+            return
+        state = str(body.get("state", ""))
+        if "overloaded" in state:
+            self.send_json(529, {"error": {"message": "Overloaded"}})
+            return
+        for name, q in body.get("questions", {}).items():
+            c = q.get("criteria")
+            if q["type"] == "noul" and c is not None and \
+                    not ("true" in c and "false" in c):
+                self.send_json(400, {"error": {"message": json.dumps([{
+                    "code": "invalid_union", "message": "Invalid input",
+                    "path": ["questions", name, "criteria",
+                             "false" if "true" in c else "true"]}])}})
+                return
+        answers = {}
+        for name, q in body.get("questions", {}).items():
+            if q["type"] == "choice":
+                options = list(q["criteria"])
+                rest = 0.3 / (len(options) - 1)
+                answers[name] = {"type": "choice", "choice": options[0],
+                                 "confidence": 0.6,
+                                 "probabilities": {o: 0.7 if i == 0 else rest
+                                                   for i, o in enumerate(options)}}
+            elif q["type"] == "noul":
+                answers[name] = {"type": "noul",
+                                 "noul": 0.93 if "bill" in state.lower() else 0.04}
+            else:
+                answers[name] = {"type": "score", "score": 1.43, "confidence": 0.35,
+                                 "probabilities": {"0": 0.0, "1": 0.57, "2": 0.43}}
+        usage = {"input_tokens": 40, "output_tokens": 0}
+        if self.headers.get("X-Title") == "Augur":
+            usage["cost"] = 0.00002
+        self.send_json(200, {"answers": answers, "usage": usage})
 
     # ---- Anthropic ------------------------------------------------------
 
@@ -228,10 +297,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         if answer:
             schema = answer[0]["input_schema"]
-            if "answer" in schema.get("properties", {}):
+            props = schema.get("properties", {})
+            if "answer" in props:
                 text = json.dumps({"answer": 42})
-            else:
+            elif "categories" in props:
                 text = json.dumps({"categories": ["sports"]})
+            else:
+                text = json.dumps(example(schema))
             self.event({"type": "content_block_start", "index": 0,
                         "content_block": {"type": "tool_use", "name": "answer"}})
             for i in range(0, len(text), 7):

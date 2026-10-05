@@ -76,6 +76,17 @@ provider = openrouter
 url = $URL
 api-key-command = echo sk-test
 model = router-model
+classifier = typesafe/jev-1.13
+
+[profile ts]
+provider = typesafe
+url = $URL
+api-key-command = echo sk-test
+classifier = jev-1.13.0
+price.jev-1.13.0 = 0.042 0
+
+[app classify.app]
+classify-profile = ts
 
 [profile wrongkey]
 provider = openai
@@ -248,6 +259,73 @@ sleep 1
 contains "a bad price says so" "price.model-main isn't two or three numbers" "$("$AUGUR" profiles)"
 sed -i 's/^price.model-main = 1 two$/price.model-main = 1 2/' "$CONFIG"
 sleep 1
+
+# ---- Classify -------------------------------------------------------------------
+cat > "$TMP/questions.json" <<'EOF'
+{
+  "team": {"type": "choice", "instructions": "Which team should handle this?",
+           "options": {"returns": "Exchanges, wrong or damaged items",
+                       "billing": "Charges, invoices, payment problems"}},
+  "bill": {"type": "yes-no", "instructions": "Is it a bill?",
+           "yes": "Asks you to pay something", "no": "Anything else"},
+  "severity": {"type": "score", "instructions": "How bad is it?",
+               "levels": ["Cosmetic", "Degraded", "Blocking"]},
+  "letter": {"type": "yes-no", "instructions": "Is it a newsletter?",
+             "yes": "Sent to many readers"}
+}
+EOF
+Q="--questions $TMP/questions.json"
+out=$("$AUGUR" classify $Q -p ts "Your bill is due")
+expect "a classifier's answers" "team: returns (0.70)
+bill: 0.93
+severity: 1.43 (confidence 0.35)
+letter: 0.93" "$out"
+expect "only yes said: no is the rest" "Sent to many readers / Anything else." "$(last_request | field 'r["body"]["questions"]["letter"]["criteria"]["true"] + " / " + r["body"]["questions"]["letter"]["criteria"]["false"]')"
+expect "... asked of System One" "/v1/systemone" "$(last_request | field 'r["path"]')"
+expect "... with its classifier" "jev-1.13.0" "$(last_request | field 'r["body"]["model"]')"
+expect "... about the input" "Your bill is due" "$(last_request | field 'r["body"]["state"]')"
+expect "yes-no is Jev's noul" "noul Asks you to pay something" "$(last_request | field 'r["body"]["questions"]["bill"]["type"] + " " + r["body"]["questions"]["bill"]["criteria"]["true"]')"
+expect "a choice's options are its criteria" "Charges, invoices, payment problems" "$(last_request | field 'r["body"]["questions"]["team"]["criteria"]["billing"]')"
+expect "a score's levels are its criteria" "Blocking" "$(last_request | field 'r["body"]["questions"]["severity"]["criteria"][2]')"
+json=$("$AUGUR" classify $Q -p ts --json "Your bill is due")
+expect "every option's probability" "0.3" "$(echo "$json" | field 'round(r["team"]["probabilities"]["billing"], 2)')"
+expect "every level's" "[0.0, 0.57, 0.43]" "$(echo "$json" | field 'r["severity"]["probabilities"]')"
+out=$("$AUGUR" classify -v $Q -p ts "hello" 2>&1 >/dev/null)
+contains "-v: a classifier answered" "[ts, jev-1.13.0: a classifier, 40 in, \$0.000002]" "$out"
+out=$("$AUGUR" classify -v $Q -p router "hello" 2>&1)
+contains "OpenRouter's classifier" "[router, typesafe/jev-1.13: a classifier, 40 in, \$0.00002]" "$out"
+contains "... no bill" "bill: 0.04" "$out"
+
+out=$("$AUGUR" classify -v $Q "Your bill is due" 2>&1)
+contains "no classifier: the chat model" "[main, model-main: a chat model, uncalibrated, 11 in" "$out"
+contains "... a choice without probabilities" "team: returns
+" "$out"
+contains "... yes or no as 1 or 0" "bill: 1.00" "$out"
+contains "... a score a whole level" "severity: 2" "$out"
+expect "... asked with the questions as a schema" "['returns', 'billing']" "$(last_request | field 'r["body"]["response_format"]["json_schema"]["schema"]["properties"]["team"]["enum"]')"
+contains "... and in the prompt" "- billing: Charges, invoices, payment problems" "$(last_request | field 'r["body"]["messages"][0]["content"]')"
+expect "... the input as the user's" "Your bill is due" "$(last_request | field 'r["body"]["messages"][1]["content"]')"
+out=$("$AUGUR" classify $Q -p claude "Your bill is due")
+contains "anthropic: no classifier, the answer tool" "bill: 1.00" "$out"
+expect "... the questions as its schema" "boolean" "$(last_request | field '[t for t in r["body"]["tools"] if t["name"] == "answer"][0]["input_schema"]["properties"]["bill"]["type"]')"
+out=$("$AUGUR" classify $Q --app-id classify.app "hi")
+contains "an app's classify-profile" "team: returns (0.70)" "$out"
+
+out=$("$AUGUR" classify $Q -p ts "overloaded" 2>&1)
+contains "an overloaded classifier" "RateLimited" "$out"
+echo '{"x": {"type": "colour", "instructions": "?"}}' > "$TMP/badq.json"
+out=$("$AUGUR" classify -q "$TMP/badq.json" hi 2>&1)
+contains "a question of no type" "type is choice, yes-no or score" "$out"
+echo '{"x": {"type": "choice", "instructions": "?", "options": {"a": "A"}}}' > "$TMP/badq.json"
+out=$("$AUGUR" classify -q "$TMP/badq.json" hi 2>&1)
+contains "a choice of one" "needs options" "$out"
+echo '{}' > "$TMP/badq.json"
+out=$("$AUGUR" classify -q "$TMP/badq.json" hi 2>&1)
+contains "no questions" "there are no questions" "$out"
+out=$("$AUGUR" ask -p ts hi 2>&1)
+contains "a classifier's profile has no chat model" "NoModel" "$out"
+contains "the log names the questions" '"questions":["team","bill","severity","letter"]' "$(cat "$LOG")"
+case "$(cat "$LOG")" in *"Your bill"*) fail "the log has no input" ;; *) pass "the log has no input" ;; esac
 
 # ---- Errors -----------------------------------------------------------------
 out=$("$AUGUR" ask rate 2>&1); status=$?

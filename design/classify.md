@@ -1,6 +1,6 @@
 # Classify: classifier models, and questions about text
 
-Status: proposed, not built.
+Status: built. The README has the interface as it is; this has why.
 
 Some models don't write: they read an input and answer questions about
 it from a fixed set of answers, with probabilities. Typesafe's Jev is
@@ -24,7 +24,8 @@ question to the next. It has three kinds of question:
   The answer is the most likely, a `confidence` (how concentrated the
   probabilities are), and every option's probability.
 - **noul** (yes or no): optionally with what counts as true and as
-  false. The answer is the probability that it's yes.
+  false, both or neither (Augur fills in the one not given as "Anything
+  else."). The answer is the probability that it's yes.
 - **score**: levels, described lowest first. The answer is a `score`
   (each level's number times its probability, summed: 1.43 is between
   the second and third), a `confidence`, and each level's probability.
@@ -98,7 +99,8 @@ its `url`.
 
 Which profile, first match wins: the request's, the `[app]` section's
 `classify-profile`, `[augur] classify-profile`, `default-profile`.
-Which model: the request's `model`, else the profile's `classifier`,
+Which model: the request's `model` (a classifier model, if the profile
+has a classifier), else the profile's `classifier`,
 else its chat model (below).
 
 ## The interface
@@ -122,6 +124,7 @@ The request:
 | `input` | s | what the questions are about (required) |
 | `questions` | a{sv} | by name (letters, digits, `_`, `-`): each an `a{sv}`, below (required, at least one) |
 | `profile`, `model` | s | optional, as for `Complete` |
+| `interactive` | b | someone's waiting for it: ahead of background work (false) |
 
 A question:
 
