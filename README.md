@@ -19,6 +19,12 @@ It needs GLib 2.74 or later, json-glib and libsoup 3
     meson test -C build          # against a pretend provider: no keys, no cost
     sudo ninja -C build install  # augurd, augur, and the D-Bus .service file
 
+The session bus reads `.service` files when it starts, so after the first
+install either log in again or tell it to look (else `augur` says "The name
+is not activatable"):
+
+    busctl --user call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus ReloadConfig
+
 Then write `~/.config/augur/config` (below) and ask it something:
 
     augur status                 # on or off, and why
