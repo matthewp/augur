@@ -1,0 +1,149 @@
+.TH AUGUR 1 2026-10-04 "Augur @version@" "User Commands"
+.SH NAME
+augur \- ask Augur, the desktop's AI service, from the shell
+.SH SYNOPSIS
+.B augur status
+.br
+.B augur profiles
+.br
+.B augur models
+.RI [ PROFILE ]
+.br
+.B augur ask
+.RB [ \-p
+.IR PROFILE ]
+.RB [ \-m
+.IR MODEL ]
+.RB [ \-t
+.IR TIER ]
+.RB [ \-s
+.IR SYSTEM ]
+.RB [ \-\-schema
+.IR JSON | @FILE ]
+.RB [ \-\-tools
+.IR FILE ]
+.RB [ \-\-max\-rounds
+.IR N ]
+.RB [ \-\-no\-stream ]
+.RB [ \-\-app\-id
+.IR ID ]
+.RB [ \-v ]
+.RI [ PROMPT ...]
+.SH DESCRIPTION
+Augur is a session D\-Bus service
+.RB ( augurd ,
+.BR io.github.matthewp.Augur )
+that gives desktop programs AI without each of them talking to AI
+providers: it knows the providers, the keys, and which model to use.
+.B augur
+asks it over D\-Bus, as any program would.
+D\-Bus starts
+.B augurd
+when it's first asked.
+.SH COMMANDS
+.TP
+.B status
+Whether Augur is on, the config it read, the default profile, and why
+it's off if it is.
+Exits 1 when it's off.
+.TP
+.B profiles
+The profiles in the config, each with its provider and tiers, and what's
+wrong with any that can't be used.
+.TP
+.BR models " [\fIPROFILE\fR]"
+The models the profile's provider lists (the default profile's if none
+is named).
+.TP
+.BR ask " [\fIOPTIONS\fR] [\fIPROMPT\fR...]"
+Asks, and prints the answer as it's written.
+The prompt is the arguments, or stdin when there are none.
+.SH OPTIONS FOR ASK
+.TP
+.BI \-p ", " \-\-profile " PROFILE"
+The profile to ask, instead of the program's or the default one.
+.TP
+.BI \-m ", " \-\-model " MODEL"
+The model, by the provider's name for it.
+.TP
+.BI \-t ", " \-\-tier " TIER"
+The model the profile gives this tier, such as
+.B smart
+or
+.BR cheap .
+.TP
+.BI \-s ", " \-\-system " TEXT"
+A system prompt.
+.TP
+.BI \-\-schema " JSON\fR|\fP@FILE"
+Answer in JSON matching this JSON Schema, given as it is or read from
+.IR FILE .
+The answer is checked, and asked for once more if it doesn't match.
+.TP
+.BI \-\-tools " FILE"
+Offer the model tools.
+.I FILE
+is a JSON array of objects with a
+.BR name ,
+a
+.BR description ,
+a
+.B schema
+(a JSON Schema for the arguments, an object) and a
+.BR command .
+A call's arguments go to the command, run by
+.BR sh (1),
+on stdin; what it prints is the result.
+If it fails, what it printed to stderr is why, and the model is told.
+.TP
+.BI \-\-max\-rounds " N"
+Turns the model gets with tools before it must answer without them
+(8).
+.TP
+.B \-\-no\-stream
+Print the answer when it's all there.
+.TP
+.BI \-\-app\-id " ID"
+Ask as this program, for its
+.B [app]
+settings in the config.
+.TP
+.BR \-v ", " \-\-verbose
+On stderr: the profile and model that answered, the tokens, and the tool
+calls.
+.SH CONFIGURATION
+.I ~/.config/augur/config
+has the profiles: a provider
+.RB ( openai ", " anthropic ", " openrouter ", " cloudflare ", " ollama
+or
+.BR openai\-compatible ),
+how to get its key, its model and its tiers; and per program settings.
+It's read again when it changes.
+See the README for all of it.
+.SH FILES
+.TP
+.I ~/.config/augur/config
+The configuration.
+.TP
+.I ~/.local/state/augur/log
+What was asked of whom: app, profile, model and tokens, never the text.
+.SH ENVIRONMENT
+.TP
+.B AUGUR_DISABLED
+Set to anything but 0 in
+.BR augurd 's
+environment, Augur is off.
+.SH EXIT STATUS
+0 on success; 1 when Augur failed or is off; 2 for a mistake on the
+command line; 130 when interrupted.
+.SH EXAMPLES
+.EX
+augur ask "Why is the sky blue?"
+augur ask \-p anthropic \-t smart \-s "Be brief." "What's a monad?"
+echo "I lost my keys" | augur ask \-\-schema \e
+    '{"type":"object","properties":{"mood":{"enum":["happy","sad"]}}}'
+.EE
+.SH SEE ALSO
+.BR busctl (1),
+.UR https://github.com/matthewp/augur
+.UE

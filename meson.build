@@ -37,13 +37,40 @@ augur = executable(
 	install: true,
 )
 
-# D-Bus starts augurd when a program first asks for it.
+# D-Bus starts augurd when a program first asks for it: through systemd,
+# as a user service, where there is systemd, else itself.
+paths = {'libexecdir': get_option('prefix') / get_option('libexecdir')}
 configure_file(
 	input: 'data/io.github.matthewp.Augur.service.in',
 	output: 'io.github.matthewp.Augur.service',
-	configuration: {'libexecdir': get_option('prefix') / get_option('libexecdir')},
+	configuration: paths,
 	install_dir: get_option('datadir') / 'dbus-1' / 'services',
 )
+systemd_user_unit_dir = get_option('systemduserunitdir')
+if systemd_user_unit_dir == ''
+	systemd = dependency('systemd', required: false)
+	if systemd.found()
+		systemd_user_unit_dir = systemd.get_variable(
+			pkgconfig: 'systemd_user_unit_dir',
+			pkgconfig_define: ['prefix', get_option('prefix')])
+	else
+		systemd_user_unit_dir = get_option('prefix') / 'lib' / 'systemd' / 'user'
+	endif
+endif
+if systemd_user_unit_dir != 'no'
+	configure_file(
+		input: 'data/augurd.service.in',
+		output: 'augurd.service',
+		configuration: paths,
+		install_dir: systemd_user_unit_dir,
+	)
+endif
+
+install_man(configure_file(
+	input: 'data/augur.1.in',
+	output: 'augur.1',
+	configuration: {'version': meson.project_version()},
+))
 
 test_schema = executable('test_schema', ['tests/test_schema.c', 'src/schema.c'],
 	dependencies: [glib, json, libm], include_directories: 'src')
@@ -57,4 +84,6 @@ if python.found() and dbus_run_session.found()
 		args: [augurd.full_path(), augur.full_path(),
 			meson.current_source_dir() / 'tests' / 'mock_provider.py'],
 		depends: [augurd, augur], timeout: 60, is_parallel: false)
+else
+	warning('the service test needs python3 and dbus-run-session: not run')
 endif

@@ -12,12 +12,20 @@ session bus can use it.
 ## Building and trying it
 
 It needs GLib 2.74 or later, json-glib and libsoup 3
-(`pacman -S glib2 json-glib libsoup3`), and meson:
+(`pacman -S glib2 json-glib libsoup3`), and meson. The tests also need
+python3 and `dbus-run-session` (from dbus); without them the service test
+isn't run.
 
     meson setup build
     ninja -C build
     meson test -C build          # against a pretend provider: no keys, no cost
-    sudo ninja -C build install  # augurd, augur, and the D-Bus .service file
+    sudo ninja -C build install  # augurd, augur, augur(1), and the D-Bus
+                                 # and systemd user service files
+
+Where there's systemd, D-Bus starts augurd through it, as the user
+service `augurd.service` (`journalctl --user -u augurd` has what it
+said); elsewhere D-Bus starts it itself. The unit goes where systemd's
+pkg-config says, or `-Dsystemduserunitdir=DIR`; `no` leaves it out.
 
 The session bus reads `.service` files when it starts, so after the first
 install either log in again or tell it to look (else `augur` says "The name

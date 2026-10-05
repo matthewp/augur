@@ -1,3 +1,4 @@
 [D-BUS Service]
 Name=io.github.matthewp.Augur
 Exec=@libexecdir@/augurd
+SystemdService=augurd.service

@@ -1,0 +1,2 @@
+option('systemduserunitdir', type: 'string', value: '',
+	description: 'Where augurd.service goes (default: systemd\'s, from pkg-config); "no" for none')
