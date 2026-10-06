@@ -145,8 +145,13 @@
   <h2>Install</h2>
 
   <h3>Debian and Ubuntu</h3>
-  <p>Debian 12 and 13 and Ubuntu 24.04, on amd64 and arm64: download the <code>.deb</code> for your system from the <a href="https://github.com/matthewp/augur/releases/latest">latest release</a>, then:</p>
-  <pre><code><span class="prompt">$ </span>sudo apt install ./augur_*.deb</code></pre>
+  <p>Debian 12 and 13 and Ubuntu 24.04, on amd64 and arm64, from Augur's signed apt repository; <code>apt upgrade</code> keeps it up to date:</p>
+  <pre><code><span class="prompt">$ </span>sudo install -d /etc/apt/keyrings
+<span class="prompt">$ </span>curl -fsSL https://pkg.gemwm.org/augur/debian/augur.gpg | sudo tee /etc/apt/keyrings/augur.gpg &gt;/dev/null
+<span class="prompt">$ </span>echo "deb [signed-by=/etc/apt/keyrings/augur.gpg] https://pkg.gemwm.org/augur/debian $(. /etc/os-release &amp;&amp; echo $VERSION_CODENAME) main" \
+    | sudo tee /etc/apt/sources.list.d/augur.list
+<span class="prompt">$ </span>sudo apt update &amp;&amp; sudo apt install augur-dbus</code></pre>
+  <p class="note">The package is <code>augur-dbus</code>, because Debian has an unrelated <code>augur</code>; the commands are <code>augur</code> and <code>augurd</code>. The key's fingerprint is <code>366F B0D8 A9D4 5D41 411A DA87 71CC 996F 42B6 F689</code>. Each <a href="https://github.com/matthewp/augur/releases/latest">release</a> has the <code>.deb</code>s too.</p>
 
   <h3>Arch Linux</h3>
   <p>From the AUR, as <a href="https://aur.archlinux.org/packages/augur-dbus"><code>augur-dbus</code></a>:</p>

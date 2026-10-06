@@ -10,11 +10,24 @@ answer out of each of them.
 
 ### Debian and Ubuntu
 
-Each [release](https://github.com/matthewp/augur/releases) has `.deb`s
-for Debian 12 and 13 and Ubuntu 24.04, on amd64 and arm64. Download the
-one for your system and install it with apt, which brings what it needs:
+From Augur's apt repository, for Debian 12 and 13 and Ubuntu 24.04 on
+amd64 and arm64; `apt upgrade` keeps it up to date. Add its signing key
+and the repository for your release, then install:
 
-    sudo apt install ./augur-dbus_0.2.1-1.debian12_amd64.deb
+    sudo install -d /etc/apt/keyrings
+    curl -fsSL https://pkg.gemwm.org/augur/debian/augur.gpg | sudo tee /etc/apt/keyrings/augur.gpg >/dev/null
+    echo "deb [signed-by=/etc/apt/keyrings/augur.gpg] https://pkg.gemwm.org/augur/debian $(. /etc/os-release && echo $VERSION_CODENAME) main" \
+      | sudo tee /etc/apt/sources.list.d/augur.list
+    sudo apt update && sudo apt install augur-dbus
+
+The key is also in this repository, as `build-aux/apt/augur.gpg`;
+`gpg --show-keys /etc/apt/keyrings/augur.gpg` should show its fingerprint:
+
+    366F B0D8 A9D4 5D41 411A DA87 71CC 996F 42B6 F689
+
+The package is `augur-dbus` because Debian has an unrelated `augur`; the
+commands are `augur` and `augurd`. Each
+[release](https://github.com/matthewp/augur/releases) has the `.deb`s too.
 
 ### Arch Linux
 
