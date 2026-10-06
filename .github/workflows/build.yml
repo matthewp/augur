@@ -1,8 +1,10 @@
 # Every push and pull request: the release tarball (meson dist builds and
-# tests it) and the .debs, each built and tested on the system it's for.
-# A tag vX.Y.Z also makes the GitHub release, with all of them attached,
-# and then the AUR's augur-dbus (build-aux/aur/publish.sh), with the key
-# in the AUR_SSH_KEY secret.
+# tests it), the .debs and the FreeBSD packages, each built and tested on
+# the system it's for. A tag vX.Y.Z also makes the GitHub release, with
+# all of them attached, and then the AUR's augur-dbus
+# (build-aux/aur/publish.sh, with the key in the AUR_SSH_KEY secret) and
+# the FreeBSD repository on pkg.gemwm.org (build-aux/freebsd/publish.sh,
+# with the signing key and R2's in secrets).
 name: Build
 
 on:
@@ -53,9 +55,28 @@ jobs:
           name: deb-${{ matrix.system.name }}-${{ matrix.arch.name }}
           path: debs/*.deb
 
+  freebsd:
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ['14.5', '15.1']
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test in FreeBSD ${{ matrix.release }}
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: ${{ matrix.release }}
+          usesh: true
+          run: build-aux/freebsd/build-pkg.sh pkgs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: freebsd-${{ matrix.release }}
+          path: pkgs/*.pkg
+
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [dist, deb]
+    needs: [dist, deb, freebsd]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -90,3 +111,36 @@ jobs:
         env:
           AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
         run: build-aux/aur/publish.sh "${GITHUB_REF_NAME#v}"
+
+  freebsd-publish:
+    needs: release
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ['14.5', '15.1']
+    runs-on: ubuntu-24.04
+    env:
+      PKG_SIGNING_KEY: ${{ secrets.PKG_SIGNING_KEY }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      R2_BUCKET: gemwm-pkg
+    steps:
+      # Not set up yet is no failure: the release has the packages anyway.
+      - if: env.PKG_SIGNING_KEY == ''
+        run: echo "::warning::PKG_SIGNING_KEY isn't set; not published to pkg.gemwm.org"
+      - if: env.PKG_SIGNING_KEY != ''
+        uses: actions/checkout@v4
+      - if: env.PKG_SIGNING_KEY != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: freebsd-${{ matrix.release }}
+          path: pkgs
+      - name: Publish in FreeBSD ${{ matrix.release }}
+        if: env.PKG_SIGNING_KEY != ''
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: ${{ matrix.release }}
+          usesh: true
+          envs: 'PKG_SIGNING_KEY R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_ENDPOINT R2_BUCKET'
+          run: build-aux/freebsd/publish.sh pkgs/*.pkg

@@ -2,7 +2,11 @@
 # augurd and augur together, on a session bus of their own, against
 # mock_provider.py: nothing here talks to a real provider.
 #
-#   test_service.sh AUGURD AUGUR MOCK_PROVIDER
+#   test_service.sh AUGURD AUGUR MOCK_PROVIDER [PYTHON]
+#
+# PYTHON is the Python to run the pretend provider with (python3 if not
+# given): on FreeBSD, say, there may be no python3 by that name. Only
+# POSIX sed, head and tail, so it runs on the BSDs too.
 set -u
 
 if [ -z "${AUGUR_TEST_BUS:-}" ]; then
@@ -12,6 +16,7 @@ fi
 AUGURD=$1
 AUGUR=$2
 MOCK=$3
+PYTHON=${4:-python3}
 TMP=$(mktemp -d)
 export XDG_CONFIG_HOME="$TMP/config" XDG_STATE_HOME="$TMP/state"
 mkdir -p "$XDG_CONFIG_HOME/augur"
@@ -37,11 +42,23 @@ expect() {
 contains() {
 	case "$3" in *"$2"*) pass "$1" ;; *) fail "$1: no [$2] in [$3]" ;; esac
 }
+# The config changed in place, as an editor would: sed's -i isn't the
+# same on GNU and BSD. edit_config SED-SCRIPT, or edit_config -a LINE
+# AFTER (LINE after the line AFTER).
+edit_config() {
+	if [ "$1" = -a ]; then
+		awk -v line="$2" -v after="$3" '{ print } $0 == after { print line }' \
+			"$CONFIG" > "$TMP/config.new"
+	else
+		sed "$1" "$CONFIG" > "$TMP/config.new"
+	fi
+	cat "$TMP/config.new" > "$CONFIG"
+}
 # The last request the provider got, as JSON.
 last_request() { tail -n 1 "$TMP/requests"; }
-field() { python3 -c "import json,sys; r=json.loads(sys.stdin.read()); print($1)"; }
+field() { "$PYTHON" -c "import json,sys; r=json.loads(sys.stdin.read()); print($1)"; }
 
-python3 "$MOCK" "$TMP/requests" > "$TMP/port" &
+"$PYTHON" "$MOCK" "$TMP/requests" > "$TMP/port" &
 PROVIDER=$!
 for _ in $(seq 50); do grep -q PORT "$TMP/port" 2>/dev/null && break; sleep 0.1; done
 PORT=$(sed -n 's/PORT //p' "$TMP/port")
@@ -206,7 +223,7 @@ expect "anthropic: the call's input is JSON" "Paris" "$(last_request | field 'r[
 expect "anthropic: a failed tool says so" "The tool said: Error: it broke" "$("$AUGUR" ask -p claude $T --no-stream broken)"
 expect "anthropic: is_error" "True" "$(last_request | field 'r["body"]["messages"][-1]["content"][0]["is_error"]')"
 expect "anthropic: tools and a schema" '{"categories":["sports"]}' "$("$AUGUR" ask -p claude $T --schema "$SCHEMA" weather)"
-expect "... any tool, the answer one included" "any" "$(head -n -1 "$TMP/requests" | tail -n 1 | field 'r["body"]["tool_choice"]["type"]')"
+expect "... any tool, the answer one included" "any" "$(tail -n 2 "$TMP/requests" | head -n 1 | field 'r["body"]["tool_choice"]["type"]')"
 
 echo '[{"name": "answer", "command": "true"}]' > "$TMP/answer.json"
 out=$("$AUGUR" ask --tools "$TMP/answer.json" hi 2>&1)
@@ -254,10 +271,10 @@ expect "usage for no one" "nothing asked" "$("$AUGUR" usage --app no.one)"
 expect "usage before it all" "nothing asked" "$("$AUGUR" usage --until 2001-01-01 --since all)"
 out=$("$AUGUR" usage --by colour 2>&1)
 contains "usage by something unknown" "not \"colour\"" "$out"
-sed -i 's/^price.model-main = 1 2$/price.model-main = 1 two/' "$CONFIG"
+edit_config 's/^price.model-main = 1 2$/price.model-main = 1 two/'
 sleep 1
 contains "a bad price says so" "price.model-main isn't two or three numbers" "$("$AUGUR" profiles)"
-sed -i 's/^price.model-main = 1 two$/price.model-main = 1 2/' "$CONFIG"
+edit_config 's/^price.model-main = 1 two$/price.model-main = 1 2/'
 sleep 1
 
 # ---- Classify -------------------------------------------------------------------
@@ -360,12 +377,12 @@ contains "the log has the app and model" '"app":"test.app","profile":"main","mod
 case "$(cat "$LOG")" in *"Hello"*|*"categorise"*|*"Paris"*) fail "the log has no text" ;; *) pass "the log has no text" ;; esac
 
 # ---- Turning it off -----------------------------------------------------------------
-sed -i 's/^default-profile = main/default-profile = main\nenabled = false/' "$CONFIG"
+edit_config -a "enabled = false" "default-profile = main"
 sleep 1
 expect "the config turns it off" "off" "$("$AUGUR" status | head -n 1)"
 out=$("$AUGUR" ask hi 2>&1)
 contains "asking while off" "Disabled" "$out"
-sed -i '/^enabled = false/d' "$CONFIG"
+edit_config '/^enabled = false/d'
 sleep 1
 expect "and on again" "on" "$("$AUGUR" status | head -n 1)"
 

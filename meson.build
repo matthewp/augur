@@ -53,8 +53,10 @@ if systemd_user_unit_dir == ''
 		systemd_user_unit_dir = systemd.get_variable(
 			pkgconfig: 'systemd_user_unit_dir',
 			pkgconfig_define: ['prefix', get_option('prefix')])
-	else
+	elif host_machine.system() == 'linux'
 		systemd_user_unit_dir = get_option('prefix') / 'lib' / 'systemd' / 'user'
+	else
+		systemd_user_unit_dir = 'no'   # the BSDs: no systemd to use it
 	endif
 endif
 if systemd_user_unit_dir != 'no'
@@ -82,7 +84,8 @@ dbus_run_session = find_program('dbus-run-session', required: false)
 if python.found() and dbus_run_session.found()
 	test('service', find_program('tests/test_service.sh'),
 		args: [augurd.full_path(), augur.full_path(),
-			meson.current_source_dir() / 'tests' / 'mock_provider.py'],
+			meson.current_source_dir() / 'tests' / 'mock_provider.py',
+			python.full_path()],
 		depends: [augurd, augur], timeout: 60, is_parallel: false)
 else
 	warning('the service test needs python3 and dbus-run-session: not run')

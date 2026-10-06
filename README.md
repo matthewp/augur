@@ -22,6 +22,32 @@ From the AUR, as [`augur-dbus`](https://aur.archlinux.org/packages/augur-dbus):
 
     paru -S augur-dbus           # or yay, or makepkg
 
+### FreeBSD
+
+From Augur's own package repository, for FreeBSD 14 and 15 on amd64. As
+root, add the repository and its signing key, then install:
+
+    mkdir -p /usr/local/etc/pkg/repos /usr/local/etc/pkg/keys
+    fetch -o /usr/local/etc/pkg/keys/augur.pub https://pkg.gemwm.org/augur/freebsd/augur.pub
+    cat > /usr/local/etc/pkg/repos/augur.conf <<'EOF'
+    augur: {
+      url: "https://pkg.gemwm.org/augur/freebsd/${ABI}",
+      signature_type: "pubkey",
+      pubkey: "/usr/local/etc/pkg/keys/augur.pub",
+      enabled: yes
+    }
+    EOF
+    pkg update && pkg install augur
+
+The key is also in this repository, as `build-aux/freebsd/augur.pub`;
+check the one you fetched is the same:
+
+    sha256 /usr/local/etc/pkg/keys/augur.pub
+    # 7235ada67ddc26324f8e1841c9732befa54306fc0f563bda486a54bc3712f1c1
+
+Augur needs a D-Bus session bus, which desktops start; there's no
+systemd here, so D-Bus starts `augurd` itself.
+
 ### From source
 
 It needs GLib 2.74 or later, json-glib and libsoup 3, and meson
@@ -39,7 +65,8 @@ isn't run.
 Where there's systemd, D-Bus starts augurd through it, as the user
 service `augurd.service` (`journalctl --user -u augurd` has what it
 said); elsewhere D-Bus starts it itself. The unit goes where systemd's
-pkg-config says, or `-Dsystemduserunitdir=DIR`; `no` leaves it out.
+pkg-config says, or `-Dsystemduserunitdir=DIR`; `no` leaves it out, as
+it is by default off Linux.
 
 To build a `.deb` yourself, on the system it's for, from the top of the
 source (it installs what it needs to build with apt, so as root, or in a
