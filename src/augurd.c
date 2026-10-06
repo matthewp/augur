@@ -176,6 +176,7 @@ static struct {
 	struct config *config;
 	char *config_error;
 	char *config_file;
+	char *config_stamp;    /* when GLib can't watch it: how it was */
 	GFileMonitor *monitor;
 	guint reload_id;
 	bool disabled_by_env;
@@ -266,6 +267,37 @@ static void config_changed(GFileMonitor *m, GFile *file, GFile *other,
 	/* Editors write in steps: read it once they've finished. */
 	g_clear_handle_id(&srv.reload_id, g_source_remove);
 	srv.reload_id = g_timeout_add(200, reload, NULL);
+}
+
+/* The config's modification time, size and inode, as text ("" if it
+ * isn't there): for looking at it where GLib can't watch files (it can't
+ * on some FreeBSDs). */
+static char *config_stamp(void) {
+	GFile *f = g_file_new_for_path(srv.config_file);
+	GFileInfo *i = g_file_query_info(f, G_FILE_ATTRIBUTE_TIME_MODIFIED ","
+		G_FILE_ATTRIBUTE_TIME_MODIFIED_USEC "," G_FILE_ATTRIBUTE_STANDARD_SIZE ","
+		G_FILE_ATTRIBUTE_UNIX_INODE, G_FILE_QUERY_INFO_NONE, NULL, NULL);
+	char *stamp = i == NULL ? g_strdup("") : g_strdup_printf(
+		"%" G_GUINT64_FORMAT ".%06u %" G_GOFFSET_FORMAT " %" G_GUINT64_FORMAT,
+		g_file_info_get_attribute_uint64(i, G_FILE_ATTRIBUTE_TIME_MODIFIED),
+		g_file_info_get_attribute_uint32(i, G_FILE_ATTRIBUTE_TIME_MODIFIED_USEC),
+		g_file_info_get_size(i),
+		g_file_info_get_attribute_uint64(i, G_FILE_ATTRIBUTE_UNIX_INODE));
+	g_clear_object(&i);
+	g_object_unref(f);
+	return stamp;
+}
+
+static gboolean config_looked_at(gpointer data) {
+	char *stamp = config_stamp();
+	if (strcmp(stamp, srv.config_stamp) != 0) {
+		g_free(srv.config_stamp);
+		srv.config_stamp = stamp;
+		config_changed(NULL, NULL, NULL, 0, NULL);
+	} else {
+		g_free(stamp);
+	}
+	return G_SOURCE_CONTINUE;
 }
 
 /* ---- The log -------------------------------------------------------------- */
@@ -1690,10 +1722,19 @@ int main(int argc, char *argv[]) {
 	srv.config_file = config != NULL ? config : config_path();
 	load_config();
 	GFile *file = g_file_new_for_path(srv.config_file);
-	srv.monitor = g_file_monitor_file(file, G_FILE_MONITOR_NONE, NULL, NULL);
+	GError *monitor_error = NULL;
+	srv.monitor = g_file_monitor_file(file, G_FILE_MONITOR_NONE, NULL,
+		&monitor_error);
 	g_object_unref(file);
 	if (srv.monitor != NULL) {
 		g_signal_connect(srv.monitor, "changed", G_CALLBACK(config_changed), NULL);
+	} else {
+		/* Looked at twice a second instead: a stat, nothing more. */
+		g_message("can't watch %s (%s); looking at it twice a second",
+			srv.config_file, monitor_error->message);
+		g_error_free(monitor_error);
+		srv.config_stamp = config_stamp();
+		g_timeout_add(500, config_looked_at, NULL);
 	}
 
 	guint owner = g_bus_own_name(G_BUS_TYPE_SESSION, BUS_NAME,
