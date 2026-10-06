@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Augur: AI for desktop programs</title>
+<meta name="description" content="Augur is a session D-Bus service that gives desktop programs AI, without each of them talking to AI providers.">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<style>
+  :root {
+    --bg: #fbfaf8;
+    --fg: #1c1b22;
+    --muted: #5f5d6b;
+    --line: #e6e3de;
+    --card: #ffffff;
+    --code-bg: #f3f1ed;
+    --accent: #4f46e5;
+    --accent-soft: #eef0ff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141318;
+      --fg: #ebe9f0;
+      --muted: #a4a1b0;
+      --line: #2b2933;
+      --card: #1b1a21;
+      --code-bg: #1f1e26;
+      --accent: #a5b4fc;
+      --accent-soft: #23234a;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 17px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  }
+  main { max-width: 46rem; margin: 0 auto; padding: 0 1.25rem 4rem; }
+  a { color: var(--accent); text-underline-offset: 0.15em; }
+  code, pre { font: 0.88em/1.55 ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; }
+  code { background: var(--code-bg); padding: 0.1em 0.35em; border-radius: 4px; }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 0.9rem 1.1rem;
+    overflow-x: auto;
+  }
+  pre code { background: none; padding: 0; font-size: 1em; }
+  .prompt { color: var(--muted); user-select: none; }
+  .comment { color: var(--muted); }
+
+  header.site {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 1.4rem 0; border-bottom: 1px solid var(--line);
+  }
+  .brand { display: flex; align-items: center; gap: 0.55rem; font-weight: 650; font-size: 1.1rem; color: var(--fg); text-decoration: none; }
+  .brand img { width: 26px; height: 26px; }
+  nav a { color: var(--muted); text-decoration: none; margin-left: 1.2rem; font-size: 0.95rem; }
+  nav a:hover { color: var(--fg); }
+
+  .hero { padding: 3.5rem 0 2rem; }
+  .hero h1 { font-size: clamp(2rem, 5vw, 2.8rem); line-height: 1.15; letter-spacing: -0.02em; margin: 0 0 1rem; }
+  .hero p { font-size: 1.15rem; color: var(--muted); margin: 0 0 1.6rem; max-width: 38rem; }
+  .buttons { display: flex; gap: 0.7rem; flex-wrap: wrap; }
+  .button {
+    display: inline-block; padding: 0.55rem 1.1rem; border-radius: 8px;
+    font-weight: 600; font-size: 0.95rem; text-decoration: none;
+    border: 1px solid var(--line); color: var(--fg); background: var(--card);
+  }
+  .button.primary { background: var(--accent); border-color: var(--accent); color: var(--bg); }
+
+  section { padding-top: 2.2rem; }
+  h2 { font-size: 1.45rem; letter-spacing: -0.01em; margin: 0 0 0.8rem; }
+  h3 { font-size: 1.05rem; margin: 1.6rem 0 0.4rem; }
+  p { margin: 0 0 1rem; }
+
+  .features { display: grid; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); gap: 0.9rem; margin-top: 1.2rem; }
+  .feature { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 1rem 1.1rem; }
+  .feature h3 { margin: 0 0 0.3rem; font-size: 1rem; }
+  .feature p { margin: 0; color: var(--muted); font-size: 0.95rem; }
+
+  .providers { color: var(--muted); }
+  .note { background: var(--accent-soft); border-radius: 10px; padding: 0.8rem 1rem; font-size: 0.95rem; }
+
+  footer { border-top: 1px solid var(--line); margin-top: 3.5rem; padding-top: 1.4rem; color: var(--muted); font-size: 0.9rem; }
+  footer a { color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+
+<header class="site">
+  <a class="brand" href="/"><img src="/favicon.svg" alt="">Augur</a>
+  <nav>
+    <a href="#install">Install</a>
+    <a href="#start">Get started</a>
+    <a href="https://github.com/matthewp/augur">GitHub</a>
+  </nav>
+</header>
+
+<div class="hero">
+  <h1>AI for desktop programs, without each one talking to AI providers.</h1>
+  <p>Augur is a session service. A program asks it over D-Bus; Augur knows the providers, the keys, which model to use, and how to get a well-formed answer out of each.</p>
+  <div class="buttons">
+    <a class="button primary" href="#install">Install</a>
+    <a class="button" href="https://github.com/matthewp/augur#readme">Read the docs</a>
+  </div>
+</div>
+
+<section>
+  <h2>What it does</h2>
+  <p class="providers">OpenAI, Anthropic, OpenRouter, Cloudflare AI Gateway, Ollama, and anything that speaks OpenAI's API.</p>
+  <div class="features">
+    <div class="feature">
+      <h3>One place for keys</h3>
+      <p>Providers and keys are set up once, for every program. Keys come from a command or your keyring, never from each app's settings.</p>
+    </div>
+    <div class="feature">
+      <h3>Answers that hold</h3>
+      <p>Give a JSON Schema and get JSON that matches it, from whatever the provider supports, checked and asked for again if it doesn't.</p>
+    </div>
+    <div class="feature">
+      <h3>Tools</h3>
+      <p>Offer the model tools; their calls come to your program as signals, already checked, and Augur carries the conversation to an answer.</p>
+    </div>
+    <div class="feature">
+      <h3>Questions with probabilities</h3>
+      <p>Ask which of these, yes or no, or how much, and get calibrated probabilities from a classifier like Jev, or a chat model's answer.</p>
+    </div>
+    <div class="feature">
+      <h3>What it costs</h3>
+      <p>Every request's tokens and cost are logged, never the text. <code>augur usage</code> adds them up by program, model or day.</p>
+    </div>
+    <div class="feature">
+      <h3>One switch</h3>
+      <p>Programs ask whether AI is on and show or hide their AI features to match. Turn it off and they all follow.</p>
+    </div>
+  </div>
+</section>
+
+<section id="install">
+  <h2>Install</h2>
+
+  <h3>Debian and Ubuntu</h3>
+  <p>Debian 12 and 13 and Ubuntu 24.04, on amd64 and arm64: download the <code>.deb</code> for your system from the <a href="https://github.com/matthewp/augur/releases/latest">latest release</a>, then:</p>
+  <pre><code><span class="prompt">$ </span>sudo apt install ./augur_*.deb</code></pre>
+
+  <h3>Arch Linux</h3>
+  <p>From the AUR, as <a href="https://aur.archlinux.org/packages/augur-dbus"><code>augur-dbus</code></a>:</p>
+  <pre><code><span class="prompt">$ </span>paru -S augur-dbus</code></pre>
+
+  <h3>FreeBSD</h3>
+  <p>FreeBSD 14 and 15 on amd64, from Augur's signed package repository. As root:</p>
+  <pre><code><span class="prompt"># </span>mkdir -p /usr/local/etc/pkg/repos /usr/local/etc/pkg/keys
+<span class="prompt"># </span>fetch -o /usr/local/etc/pkg/keys/augur.pub https://pkg.gemwm.org/augur/freebsd/augur.pub
+<span class="prompt"># </span>cat &gt; /usr/local/etc/pkg/repos/augur.conf &lt;&lt;'EOF'
+augur: {
+  url: "https://pkg.gemwm.org/augur/freebsd/${ABI}",
+  signature_type: "pubkey",
+  pubkey: "/usr/local/etc/pkg/keys/augur.pub",
+  enabled: yes
+}
+EOF
+<span class="prompt"># </span>pkg update &amp;&amp; pkg install augur</code></pre>
+  <p class="note">The key's SHA-256 is <code>7235ada6…3712f1c1</code>; the whole of it is in the <a href="https://github.com/matthewp/augur#freebsd">README</a>, and the key is in the source as <code>build-aux/freebsd/augur.pub</code>.</p>
+
+  <h3>From source</h3>
+  <p>GLib 2.74 or later, json-glib, libsoup 3 and meson:</p>
+  <pre><code><span class="prompt">$ </span>meson setup build &amp;&amp; ninja -C build
+<span class="prompt">$ </span>sudo ninja -C build install</code></pre>
+</section>
+
+<section id="start">
+  <h2>Get started</h2>
+  <p>Nothing runs until something asks: D-Bus starts <code>augurd</code> then, and it leaves after a minute with nothing to do. Give it a profile, a provider and how to get its key, in <code>~/.config/augur/config</code>:</p>
+  <pre><code>[profile openrouter]
+provider = openrouter
+api-key-command = pass show openrouter
+model = deepseek/deepseek-v4-flash</code></pre>
+  <p>Then ask it something from the shell:</p>
+  <pre><code><span class="prompt">$ </span>augur status
+<span class="prompt">$ </span>augur ask "Why is the sky blue?"
+<span class="prompt">$ </span>augur usage</code></pre>
+</section>
+
+<section>
+  <h2>From your program</h2>
+  <p>Augur is <code>org.gemwm.Augur</code> on the session bus. The simplest call waits for the whole answer; <code>Complete</code> streams it, and <code>Classify</code> answers questions with probabilities.</p>
+  <pre><code><span class="prompt">$ </span>gdbus call --session --dest org.gemwm.Augur \
+    --object-path /org/gemwm/Augur --method org.gemwm.Augur1.Ask \
+    "{'app-id': &lt;'org.example.App'&gt;,
+      'messages': &lt;[{'role': &lt;'user'&gt;, 'content': &lt;'Say hello'&gt;}]&gt;}"</code></pre>
+  <p>The whole interface, the configuration, and the command line are in the <a href="https://github.com/matthewp/augur#readme">README</a>.</p>
+</section>
+
+<footer>
+  Augur is free software under the BSD 3-Clause license. <a href="https://github.com/matthewp/augur">Source on GitHub</a> · <a href="https://github.com/matthewp/augur/releases">Releases</a>
+</footer>
+
+</main>
+</body>
+</html>
