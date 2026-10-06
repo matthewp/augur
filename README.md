@@ -6,10 +6,27 @@ knows the providers (OpenAI, Anthropic, OpenRouter, Cloudflare AI Gateway,
 Ollama...), the keys, which model to use, and how to get a well-formed
 answer out of each of them.
 
-## Building and trying it
+## Install
 
-It needs GLib 2.74 or later, json-glib and libsoup 3
-(`pacman -S glib2 json-glib libsoup3`), and meson. The tests also need
+### Debian and Ubuntu
+
+Each [release](https://github.com/matthewp/augur/releases) has `.deb`s
+for Debian 12 and 13 and Ubuntu 24.04, on amd64 and arm64. Download the
+one for your system and install it with apt, which brings what it needs:
+
+    sudo apt install ./augur_0.1.0-1.debian12_amd64.deb
+
+### Arch Linux
+
+From the AUR, as [`augur-dbus`](https://aur.archlinux.org/packages/augur-dbus):
+
+    paru -S augur-dbus           # or yay, or makepkg
+
+### From source
+
+It needs GLib 2.74 or later, json-glib and libsoup 3, and meson
+(`pacman -S glib2 json-glib libsoup3 meson`, or `apt install meson
+libglib2.0-dev libjson-glib-dev libsoup-3.0-dev`). The tests also need
 python3 and `dbus-run-session` (from dbus); without them the service test
 isn't run.
 
@@ -24,55 +41,39 @@ service `augurd.service` (`journalctl --user -u augurd` has what it
 said); elsewhere D-Bus starts it itself. The unit goes where systemd's
 pkg-config says, or `-Dsystemduserunitdir=DIR`; `no` leaves it out.
 
-The session bus reads `.service` files when it starts, so after the first
-install either log in again or tell it to look (else `augur` says "The name
-is not activatable"):
-
-    busctl --user call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus ReloadConfig
-
-Debian 12 and 13 and Ubuntu 24.04 (amd64 and arm64) have `.deb`s on each
-[release](https://github.com/matthewp/augur/releases). To build one
-yourself, on the system it's for, from the top of the source (it installs
-what it needs to build with apt, so as root, or in a container):
+To build a `.deb` yourself, on the system it's for, from the top of the
+source (it installs what it needs to build with apt, so as root, or in a
+container):
 
     build-aux/build-deb.sh OUTDIR
 
-Then write `~/.config/augur/config` (below) and ask it something:
+## Getting started
 
-    augur status                 # on or off, and why
-    augur profiles               # the profiles, and what's wrong with any
-    augur models                 # what the default profile's provider lists
-    augur ask "Say hello"        # the answer, as it's written
-    augur ask -p anthropic -t smart -s "Be brief." "Why is the sky blue?"
-    augur ask --schema '{"type":"object","properties":{"mood":{"enum":["happy","sad"]}},"required":["mood"]}' "I lost my keys"
-    echo "a prompt from stdin" | augur ask -v    # -v: the model and tokens
-    augur ask --tools tools.json "What's the weather in Paris?"
-    augur usage                  # this month's requests, tokens and cost, by app
-    augur usage --since week --by model,day
-    augur classify -q questions.json "Your invoice is attached"
+Nothing runs until something asks: D-Bus starts `augurd` then, and it
+exits after a minute with nothing to do. What it needs is a profile: a
+provider, and how to get its key. Put one in `~/.config/augur/config`:
 
-A tools file is a JSON array of `{name, description, schema, command}`: a
-call's arguments go to the command on stdin, what it prints is the result,
-and if it fails, what it printed to stderr is why.
+```ini
+[profile openrouter]
+provider = openrouter
+api-key-command = pass show openrouter   # anything that prints the key
+model = deepseek/deepseek-v4-flash
+```
 
-## Names
+Then:
 
-| What            | Name                                |
-|-----------------|-------------------------------------|
-| Bus name        | `io.github.matthewp.Augur`          |
-| Object          | `/io/github/matthewp/Augur`         |
-| Interface       | `io.github.matthewp.Augur1`         |
-| Program         | `augurd`                            |
-| Command line    | `augur` (ask from the shell, list profiles, check config) |
-| Config          | `~/.config/augur/config`            |
+    augur status                 # on, and the default profile
+    augur ask "Say hello"
 
-The interface carries a version (`Augur1`); an incompatible change is
-`Augur2`, served alongside.
+If `augur` says "The name is not activatable", the session bus hasn't
+read Augur's `.service` file since it was installed: log in again, or
+tell it to look:
 
-`augurd` is started by D-Bus when first asked (a `.service` file in
-`/usr/share/dbus-1/services`) and exits after a minute with nothing to do.
+    busctl --user call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus ReloadConfig
 
 ## Configuration
+
+`~/.config/augur/config`, read again whenever it changes. A fuller one:
 
 ```ini
 [augur]
@@ -112,6 +113,17 @@ profile = cloud
 model = deepseek-v4-flash
 classify-profile = openrouter
 ```
+
+The `[augur]` section:
+
+| Key | Meaning |
+|-----|---------|
+| `enabled` | `false` turns Augur off (below) |
+| `default-profile` | the profile when a request and its app's section name none; else the first that can be used |
+| `classify-profile` | the profile for `Classify` when the request and its app's section name none |
+
+An `[app ID]` section, for the program with that app ID: `profile`,
+`model`, `tier` and `classify-profile`, used when its requests don't say.
 
 A profile's settings:
 
@@ -162,7 +174,7 @@ and the profile is the request's, else the app section's, else
 for categories") and it beats Augur's config; leaving it empty defers to
 Augur's.
 
-## Turning it off
+### Turning it off
 
 Programs read the `Enabled` property and show their AI features only when
 it's true. It's false when:
@@ -173,7 +185,44 @@ it's true. It's false when:
 
 While off, every method fails with `io.github.matthewp.Augur1.Error.Disabled`.
 
+## The command line
+
+`augur` asks `augurd` as any program would; `man augur` has all of it.
+
+    augur status                 # on or off, and why
+    augur profiles               # the profiles, and what's wrong with any
+    augur models                 # what the default profile's provider lists
+
+**Asking.** The answer is printed as it's written; the prompt is the
+arguments, or stdin.
+
+    augur ask "Why is the sky blue?"
+    augur ask -p anthropic -t smart -s "Be brief." "Why is the sky blue?"
+    echo "a prompt from stdin" | augur ask -v    # -v: the model, tokens and cost
+    augur ask --schema '{"type":"object","properties":{"mood":{"enum":["happy","sad"]}},"required":["mood"]}' "I lost my keys"
+
+**Tools.** `--tools FILE` offers the model tools, each a shell command:
+a JSON array of `{name, description, schema, command}`. A call's
+arguments go to the command on stdin, what it prints is the result, and
+if it fails, what it printed to stderr is why.
+
+    augur ask --tools tools.json "What's the weather in Paris?"
+
+**Classifying.** `-q FILE` is a JSON object of questions by name, as
+`Classify` takes them (below):
+
+    augur classify -q questions.json "Your invoice is attached"
+
+**What it's costing.** Requests, tokens and dollars, from the log:
+
+    augur usage                  # this month's, by app
+    augur usage --since week --by model,day
+
 ## The D-Bus interface
+
+Augur is `io.github.matthewp.Augur` on the session bus, with its object at
+`/io/github/matthewp/Augur`. The interface carries a version (`Augur1`);
+an incompatible change would be `Augur2`, served alongside.
 
 ```
 interface io.github.matthewp.Augur1
