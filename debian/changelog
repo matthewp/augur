@@ -1,3 +1,10 @@
+augur (0.1.1-1) unstable; urgency=medium
+
+  * The AUR's augur-dbus is published with each release.
+  * The README has install instructions for Debian, Ubuntu and Arch.
+
+ -- Matthew Phillips <matthew@matthewphillips.info>  Mon, 05 Oct 2026 20:40:06 -0400
+
 augur (0.1.0-1) unstable; urgency=medium
 
   * First release.

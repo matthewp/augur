@@ -14,7 +14,7 @@ Each [release](https://github.com/matthewp/augur/releases) has `.deb`s
 for Debian 12 and 13 and Ubuntu 24.04, on amd64 and arm64. Download the
 one for your system and install it with apt, which brings what it needs:
 
-    sudo apt install ./augur_0.1.0-1.debian12_amd64.deb
+    sudo apt install ./augur_0.1.1-1.debian12_amd64.deb
 
 ### Arch Linux
 
