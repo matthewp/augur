@@ -19,6 +19,8 @@
 #include <gio/gio.h>
 #include <glib-unix.h>
 #include <json-glib/json-glib.h>
+#include <glib/gstdio.h>
+#include <unistd.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -615,10 +617,25 @@ static void tool_call(const char *id, const char *name, const char *arguments) {
 	}
 	const char *command = g_hash_table_lookup(ask.commands, name);
 	GError *error = NULL;
-	const char *argv[] = { "/bin/sh", "-c", command, NULL };
-	GSubprocess *p = command == NULL ? NULL : g_subprocess_newv(argv,
-		G_SUBPROCESS_FLAGS_STDIN_PIPE | G_SUBPROCESS_FLAGS_STDOUT_PIPE |
-		G_SUBPROCESS_FLAGS_STDERR_PIPE, &error);
+	GSubprocess *p = NULL;
+	/* The arguments come from a file, not a pipe: a command that doesn't
+	 * read them, and is done before they'd be written, is no error. */
+	char *path = NULL;
+	int fd = command != NULL ? g_file_open_tmp("augur-tool-XXXXXX", &path,
+		&error) : -1;
+	if (fd >= 0) {
+		close(fd);
+		if (g_file_set_contents(path, arguments, -1, &error)) {
+			GSubprocessLauncher *l = g_subprocess_launcher_new(
+				G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_PIPE);
+			g_subprocess_launcher_set_stdin_file_path(l, path);
+			p = g_subprocess_launcher_spawn(l, &error, "/bin/sh", "-c", command,
+				NULL);
+			g_object_unref(l);
+		}
+		g_unlink(path);   /* the command has it open */
+		g_free(path);
+	}
 	if (p == NULL) {
 		g_dbus_connection_call(bus, BUS_NAME, ask.handle, REQUEST_IFACE,
 			"ToolFailed", g_variant_new("(ss)", id, error != NULL ? error->message :
@@ -628,7 +645,7 @@ static void tool_call(const char *id, const char *name, const char *arguments) {
 	}
 	struct tool_run *run = g_new0(struct tool_run, 1);
 	run->id = g_strdup(id);
-	g_subprocess_communicate_utf8_async(p, arguments, NULL, tool_ran, run);
+	g_subprocess_communicate_utf8_async(p, NULL, NULL, tool_ran, run);
 	g_object_unref(p);
 }
 
