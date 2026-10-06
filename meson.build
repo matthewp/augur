@@ -41,8 +41,8 @@ augur = executable(
 # as a user service, where there is systemd, else itself.
 paths = {'libexecdir': get_option('prefix') / get_option('libexecdir')}
 configure_file(
-	input: 'data/io.github.matthewp.Augur.service.in',
-	output: 'io.github.matthewp.Augur.service',
+	input: 'data/org.gemwm.Augur.service.in',
+	output: 'org.gemwm.Augur.service',
 	configuration: paths,
 	install_dir: get_option('datadir') / 'dbus-1' / 'services',
 )

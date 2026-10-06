@@ -214,8 +214,8 @@ contains "the answer tool is Augur's" "can't be called \"answer\"" "$out"
 echo '[{"name": "t", "schema": {"type": "string"}, "command": "true"}]' > "$TMP/string.json"
 out=$("$AUGUR" ask --tools "$TMP/string.json" hi 2>&1)
 contains "a tool's schema is for an object" "isn't a JSON Schema for an object" "$out"
-out=$(gdbus call --session --dest io.github.matthewp.Augur --object-path /io/github/matthewp/Augur \
-	--method io.github.matthewp.Augur1.Ask \
+out=$(gdbus call --session --dest org.gemwm.Augur --object-path /org/gemwm/Augur \
+	--method org.gemwm.Augur1.Ask \
 	"{'app-id': <'t'>, 'messages': <[{'role': <'user'>, 'content': <'hi'>}]>, 'tools': <[{'name': <'t'>}]>}" 2>&1)
 contains "tools need Complete" "tools need Complete" "$out"
 "$AUGUR" ask $T slowtool > /dev/null 2>&1 &

@@ -25,9 +25,9 @@
 #include <stdio.h>
 #include <string.h>
 
-#define BUS_NAME "io.github.matthewp.Augur"
-#define OBJECT_PATH "/io/github/matthewp/Augur"
-#define IFACE "io.github.matthewp.Augur1"
+#define BUS_NAME "org.gemwm.Augur"
+#define OBJECT_PATH "/org/gemwm/Augur"
+#define IFACE "org.gemwm.Augur1"
 #define REQUEST_IFACE IFACE ".Request"
 
 static GDBusConnection *bus;

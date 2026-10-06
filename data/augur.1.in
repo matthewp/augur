@@ -53,7 +53,7 @@ augur \- ask Augur, the desktop's AI service, from the shell
 .SH DESCRIPTION
 Augur is a session D\-Bus service
 .RB ( augurd ,
-.BR io.github.matthewp.Augur )
+.BR org.gemwm.Augur )
 that gives desktop programs AI without each of them talking to AI
 providers: it knows the providers, the keys, and which model to use.
 .B augur

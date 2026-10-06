@@ -1,5 +1,5 @@
 /*
- * augurd: Augur's service, on the session bus as io.github.matthewp.Augur.
+ * augurd: Augur's service, on the session bus as org.gemwm.Augur.
  * D-Bus starts it when a program first asks, and it goes when it's had
  * nothing to do for a while. See README.md for the interface.
  *
@@ -30,10 +30,10 @@
 #include "provider.h"
 #include "schema.h"
 
-#define BUS_NAME "io.github.matthewp.Augur"
-#define OBJECT_PATH "/io/github/matthewp/Augur"
+#define BUS_NAME "org.gemwm.Augur"
+#define OBJECT_PATH "/org/gemwm/Augur"
 #define REQUEST_PATH OBJECT_PATH "/request"
-#define IFACE "io.github.matthewp.Augur1"
+#define IFACE "org.gemwm.Augur1"
 #define REQUEST_IFACE IFACE ".Request"
 #define ERROR_PREFIX IFACE ".Error."
 #define IDLE_TIMEOUT 60     /* seconds with nothing to do, then exit */

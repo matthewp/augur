@@ -4,5 +4,5 @@ Documentation=man:augur(1) https://github.com/matthewp/augur
 
 [Service]
 Type=dbus
-BusName=io.github.matthewp.Augur
+BusName=org.gemwm.Augur
 ExecStart=@libexecdir@/augurd

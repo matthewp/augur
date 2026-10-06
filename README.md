@@ -183,7 +183,7 @@ it's true. It's false when:
 - `AUGUR_DISABLED=1` is in Augur's environment, or
 - no profile can be used (no config, or no key).
 
-While off, every method fails with `io.github.matthewp.Augur1.Error.Disabled`.
+While off, every method fails with `org.gemwm.Augur1.Error.Disabled`.
 
 ## The command line
 
@@ -220,12 +220,12 @@ if it fails, what it printed to stderr is why.
 
 ## The D-Bus interface
 
-Augur is `io.github.matthewp.Augur` on the session bus, with its object at
-`/io/github/matthewp/Augur`. The interface carries a version (`Augur1`);
+Augur is `org.gemwm.Augur` on the session bus, with its object at
+`/org/gemwm/Augur`. The interface carries a version (`Augur1`);
 an incompatible change would be `Augur2`, served alongside.
 
 ```
-interface io.github.matthewp.Augur1
+interface org.gemwm.Augur1
 
   property Enabled: b                       (changes are signalled)
 
@@ -247,7 +247,7 @@ interface io.github.matthewp.Augur1
   method Usage(query: a{sv}) -> (rows: aa{sv})
                                     # the log, added up: see below
 
-interface io.github.matthewp.Augur1.Request     (on each handle)
+interface org.gemwm.Augur1.Request     (on each handle)
 
   signal Delta(text: s)                     # streamed text, as it comes
   signal Done(text: s, info: a{sv})         # the whole answer
@@ -291,7 +291,7 @@ since 1970; until isn't included), `app-id` (s), and `by` (as: any of
 
 Signals for a request go to the program that made it alone (D-Bus unicast
 signals), never to the bus at large. Subscribe to them (sender
-`io.github.matthewp.Augur`, interface `io.github.matthewp.Augur1.Request`)
+`org.gemwm.Augur`, interface `org.gemwm.Augur1.Request`)
 before calling `Complete`, and keep the ones for the handle it returns: a
 short answer can be done before the reply's been read. `augur ask` does
 this; see `src/augur.c`. A handle is removed once its `Done` or
@@ -381,7 +381,7 @@ aren't made up: it has none to give.
 
 The log has the questions' names, never the input or the answers.
 
-Errors, each `io.github.matthewp.Augur1.Error.` and: `Disabled`,
+Errors, each `org.gemwm.Augur1.Error.` and: `Disabled`,
 `NoProfile`, `NoModel`, `Auth` (the key was refused or couldn't be got),
 `RateLimited`, `Provider` (anything else the provider said, with its
 message), `Schema`, `Cancelled`. A malformed request is

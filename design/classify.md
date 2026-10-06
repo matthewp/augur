@@ -106,7 +106,7 @@ else its chat model (below).
 ## The interface
 
 ```
-interface io.github.matthewp.Augur1
+interface org.gemwm.Augur1
 
   method Classify(request: a{sv}) -> (answers: a{sv}, info: a{sv})
 ```
