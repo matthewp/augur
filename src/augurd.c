@@ -1726,6 +1726,14 @@ int main(int argc, char *argv[]) {
 	srv.monitor = g_file_monitor_file(file, G_FILE_MONITOR_NONE, NULL,
 		&monitor_error);
 	g_object_unref(file);
+	/* Where GLib can't watch files it gives a monitor that looks every five
+	 * seconds (GPollFileMonitor), which is too slow to call watching. */
+	if (srv.monitor != NULL &&
+			strcmp(G_OBJECT_TYPE_NAME(srv.monitor), "GPollFileMonitor") == 0) {
+		g_clear_object(&srv.monitor);
+		monitor_error = g_error_new_literal(G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
+			"GLib can only look every five seconds");
+	}
 	if (srv.monitor != NULL) {
 		g_signal_connect(srv.monitor, "changed", G_CALLBACK(config_changed), NULL);
 	} else {
