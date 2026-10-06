@@ -30,5 +30,5 @@ tar -c --exclude=./.git --exclude=./build . | tar -x -C "$work/augur"
 cd "$work/augur"
 sed -i "1s/(\([^)]*\))/(\1$suffix)/" debian/changelog
 dpkg-buildpackage -us -uc -b
-cp ../augur_*.deb "$out/"
+cp ../augur-dbus_*.deb "$out/"
 ls -l "$out"

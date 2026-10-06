@@ -2,9 +2,10 @@
 # tests it), the .debs and the FreeBSD packages, each built and tested on
 # the system it's for. A tag vX.Y.Z also makes the GitHub release, with
 # all of them attached, and then the AUR's augur-dbus
-# (build-aux/aur/publish.sh, with the key in the AUR_SSH_KEY secret) and
-# the FreeBSD repository on pkg.gemwm.org (build-aux/freebsd/publish.sh,
-# with the signing key and R2's in secrets).
+# (build-aux/aur/publish.sh, with the key in the AUR_SSH_KEY secret), and
+# the apt and FreeBSD repositories on pkg.gemwm.org
+# (build-aux/apt/publish.sh and build-aux/freebsd/publish.sh, with their
+# signing keys and R2's in secrets).
 name: Build
 
 on:
@@ -144,3 +145,26 @@ jobs:
           usesh: true
           envs: 'PKG_SIGNING_KEY R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_ENDPOINT R2_BUCKET'
           run: build-aux/freebsd/publish.sh pkgs/*.pkg
+
+  apt-publish:
+    needs: release
+    runs-on: ubuntu-24.04
+    env:
+      APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      R2_BUCKET: gemwm-pkg
+    steps:
+      # Not set up yet is no failure: the release has the .debs anyway.
+      - if: env.APT_SIGNING_KEY == ''
+        run: echo "::warning::APT_SIGNING_KEY isn't set; not published to pkg.gemwm.org"
+      - if: env.APT_SIGNING_KEY != ''
+        uses: actions/checkout@v4
+      # The release's own .debs: what's published is what was released.
+      - if: env.APT_SIGNING_KEY != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$GITHUB_REF_NAME" --pattern '*.deb' --dir debs
+      - if: env.APT_SIGNING_KEY != ''
+        run: build-aux/apt/publish.sh debs
