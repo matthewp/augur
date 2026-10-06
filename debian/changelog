@@ -1,3 +1,12 @@
+augur (0.2.1-1) unstable; urgency=medium
+
+  * The package is augur-dbus: Debian and Ubuntu have an unrelated augur
+    (Nextstrain's), with its own /usr/bin/augur. augur-dbus takes over
+    from Augur's own augur packages.
+  * An apt repository, signed, for Debian 12 and 13 and Ubuntu 24.04.
+
+ -- Matthew Phillips <matthew@matthewphillips.info>  Tue, 06 Oct 2026 19:50:21 -0400
+
 augur (0.2.0-1) unstable; urgency=medium
 
   * D-Bus: Augur is org.gemwm.Augur, its object /org/gemwm/Augur and its

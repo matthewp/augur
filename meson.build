@@ -1,7 +1,7 @@
 project(
 	'augur',
 	'c',
-	version: '0.2.0',
+	version: '0.2.1',
 	license: 'BSD-3-Clause',
 	meson_version: '>=1.0.0',
 	default_options: ['c_std=gnu11', 'warning_level=2', 'werror=false'],
