@@ -83,7 +83,7 @@ provider = typesafe                # url https://api.typesafe.ai/v1
 api-key-command = pass show typesafe
 classifier = jev-1.13.0
 
-[app org.gemwm.GemMail]
+[app org.example.Mail]
 classify-profile = openrouter
 ```
 
@@ -180,19 +180,21 @@ a threshold still works, only more coarsely.
 - The log: the app, profile, model, tokens, and the questions' names;
   never the input, the instructions or the answers.
 
-## First user: GemMail's categories
+## Example: a mail program's categories
 
-Categories overlap, so each is a `yes-no` question, its description the
-instructions; all of a message's go in one `Classify`. Above one
-probability (0.8) a category is applied; between that and a lower one
-it's suggested, and the user's choice joins the corrections. Without a
-classifier it's what's planned now, an LLM's list, with the same code.
+A mail program sorts mail into categories (Bill, Newsletter, Shipping),
+and a message can be in several. Categories overlap, so each is a
+`yes-no` question, its description the instructions; all of a message's
+go in one `Classify`. Above one probability (0.8) a category is
+applied; between that and a lower one it's suggested, and the user's
+choice joins their corrections. Without a classifier the same code gets
+a chat model's yes or no for each.
 
 ## Open questions
 
-- **Several inputs at once.** GemMail categorising a folder sends one
-  request per message. Jev answers one state per request; an `inputs`
-  (as) that Augur sends in parallel would save the program the
+- **Several inputs at once.** A mail program categorising a folder sends
+  one request per message. Jev answers one state per request; an
+  `inputs` (as) that Augur sends in parallel would save the program the
   bookkeeping, if it's needed.
 - **JSON input.** Jev's state can be JSON, not only text. `input` as a
   string is enough until something needs more.

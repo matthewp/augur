@@ -1500,7 +1500,7 @@ static GVariant *status(void) {
 	if (srv.config_error != NULL) {
 		why = srv.config_error;
 	} else if (srv.disabled_by_env) {
-		why = "AUGUR_DISABLED is set (by the session, e.g. GemWM's [ai])";
+		why = "AUGUR_DISABLED is set in Augur's environment (by the session)";
 	} else if (!srv.config->enabled) {
 		why = "turned off in the config ([augur] enabled = false)";
 	} else if (srv.config->profiles->len == 0) {

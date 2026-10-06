@@ -6,9 +6,6 @@ knows the providers (OpenAI, Anthropic, OpenRouter, Cloudflare AI Gateway,
 Ollama...), the keys, which model to use, and how to get a well-formed
 answer out of each of them.
 
-GemWM uses it, but nothing in it knows about GemWM: any program on the
-session bus can use it.
-
 ## Building and trying it
 
 It needs GLib 2.74 or later, json-glib and libsoup 3
@@ -57,33 +54,6 @@ Then write `~/.config/augur/config` (below) and ask it something:
 A tools file is a JSON array of `{name, description, schema, command}`: a
 call's arguments go to the command on stdin, what it prints is the result,
 and if it fails, what it printed to stderr is why.
-
-## Why a service
-
-- **One place for providers and keys.** Configured once, not per program;
-  keys come from a command or the keyring, never from each app's settings.
-- **Programs don't speak provider protocols.** They send messages and get
-  text back. Augur does HTTP, each provider's format, streaming, retries and
-  rate limits.
-- **Structured answers that hold.** A program can give a JSON Schema and get
-  back JSON that matches it, or an error, whatever the provider supports:
-  its own structured output where it has it, else tool use, else prompting
-  and checking (and asking again).
-- **Tools without the loop.** A program offers the model tools and gets
-  their calls as signals, with arguments already checked against the
-  tool's schema; Augur carries the conversation to the answer.
-- **Questions with probabilities.** A program asks questions about some
-  text (which of these? yes or no? how much?) and gets answers with how
-  likely each is: from a classifier model like Jev, or from a chat model
-  when there's none, the same way.
-- **One switch.** Programs ask whether AI is on and show or hide their AI
-  features to match.
-
-Non-goals: Augur doesn't decide what's private. A program that sends text
-to Augur has decided to; asking the user is the program's job (GemMail's
-categories are something you turn on, for example). There are no per-app
-permission prompts: every program runs as you and could read Augur's
-config itself, so a prompt would only look like protection.
 
 ## Names
 
@@ -137,7 +107,7 @@ model = deepseek/deepseek-v4-flash
 classifier = typesafe/jev-1.13
 
 # Per program, by app ID: which profile, and what it uses.
-[app org.gemwm.GemMail]
+[app org.example.Mail]
 profile = cloud
 model = deepseek-v4-flash
 classify-profile = openrouter
@@ -200,11 +170,6 @@ it's true. It's false when:
 - `[augur] enabled = false`, or
 - `AUGUR_DISABLED=1` is in Augur's environment, or
 - no profile can be used (no config, or no key).
-
-GemWM's own switch is `[ai] enabled = false` in its config: `gemwm-session`
-then puts `AUGUR_DISABLED=1` in the session's activation environment (it
-already runs `dbus-update-activation-environment`), so Augur reports itself
-off. Outside GemWM, Augur's own config is all there is.
 
 While off, every method fails with `io.github.matthewp.Augur1.Error.Disabled`.
 
@@ -378,10 +343,10 @@ message), `Schema`, `Cancelled`. A malformed request is
 - C, GLib/GIO for D-Bus and the main loop, libsoup 3 for HTTP, json-glib
   for JSON. Server-sent events (the streaming
   format both OpenAI's and Anthropic's APIs use) parsed as they arrive.
-- A queue per profile, so a burst from one program (GemMail categorising a
-  new folder) doesn't hold up an answer someone is waiting to read:
-  requests without a schema go ahead of ones with one, and at most
-  `max-concurrent` go to a provider at once.
+- A queue per profile, so a burst from one program (a mail program
+  categorising a new folder) doesn't hold up an answer someone is waiting
+  to read: requests without a schema go ahead of ones with one, and at
+  most `max-concurrent` go to a provider at once.
 - The config is read again when it changes; `Enabled` follows, signalled.
 - Keys are fetched by running the command when first needed and kept in
   memory, never written anywhere.
@@ -389,30 +354,6 @@ message), `Schema`, `Cancelled`. A malformed request is
   not the text) in `~/.local/state/augur/log`, a line of JSON each, for
   "what's this costing me": `augur usage` and the `Usage` method add it
   up.
-
-## First user: GemMail's categories (next)
-
-Mail can be in several categories, like "Newsletter", "Bill", "Sports".
-Categories are GemMail's; Augur only answers. (Labels, should GemMail have
-them, are what you put on mail yourself; categories are what it works
-out.)
-
-- A few come built in, each a name and a description; you can change them
-  and add your own. The descriptions are the point: they're what the model
-  goes by ("Bill: asks you to pay something, or says a payment was taken").
-- It's off until you turn it on (it sends your mail to the provider).
-- New mail is categorised in the background: the sender, subject, and the
-  first couple of thousand characters of the text, never attachments.
-  Several messages go in one request.
-- The request's schema allows only the category names, as a list (none is
-  fine), per message.
-- The answer is kept in GemMail's cache database with the model that gave
-  it; changing the categories or the model categorises again, newest first.
-- Putting a message in a category yourself, or taking it out, is kept and
-  never overwritten, and the latest such corrections go into the prompt as
-  examples.
-- The folder list shows categories under the folders, as views across all
-  of them.
 
 ## Open questions
 
