@@ -1,6 +1,8 @@
 # Every push and pull request: the release tarball (meson dist builds and
 # tests it) and the .debs, each built and tested on the system it's for.
-# A tag vX.Y.Z also makes the GitHub release, with all of them attached.
+# A tag vX.Y.Z also makes the GitHub release, with all of them attached,
+# and then the AUR's augur-dbus (build-aux/aur/publish.sh), with the key
+# in the AUR_SSH_KEY secret.
 name: Build
 
 on:
@@ -77,3 +79,14 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" out/* \
             --title "Augur ${GITHUB_REF_NAME#v}" --generate-notes
+
+  aur:
+    needs: release
+    runs-on: ubuntu-24.04
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish augur-dbus
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: build-aux/aur/publish.sh "${GITHUB_REF_NAME#v}"
