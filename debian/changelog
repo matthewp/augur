@@ -1,3 +1,13 @@
+augur (0.2.0-1) unstable; urgency=medium
+
+  * D-Bus: Augur is org.gemwm.Augur, its object /org/gemwm/Augur and its
+    interface org.gemwm.Augur1; the io.github.matthewp names are gone.
+  * Packages for FreeBSD 14 and 15, from a signed repository.
+  * Where GLib can't watch files, augurd looks at its config twice a
+    second, so changes to it still take effect.
+
+ -- Matthew Phillips <matthew@matthewphillips.info>  Tue, 06 Oct 2026 18:59:05 -0400
+
 augur (0.1.1-1) unstable; urgency=medium
 
   * The AUR's augur-dbus is published with each release.
